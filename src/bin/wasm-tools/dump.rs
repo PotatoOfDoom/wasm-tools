@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::fmt::Write as _;
 use std::io::Write;
 use termcolor::{Color, ColorSpec, WriteColor};
@@ -422,6 +422,31 @@ impl<'a> Dump<'a> {
                             | CanonicalFunction::ThreadHwConcurrency => {
                                 ("core func", &mut i.core_funcs)
                             }
+                            CanonicalFunction::TaskBackpressure
+                            | CanonicalFunction::TaskReturn { .. }
+                            | CanonicalFunction::TaskWait { .. }
+                            | CanonicalFunction::TaskPoll { .. }
+                            | CanonicalFunction::TaskYield { .. }
+                            | CanonicalFunction::SubtaskDrop
+                            | CanonicalFunction::StreamNew { .. }
+                            | CanonicalFunction::StreamRead { .. }
+                            | CanonicalFunction::StreamWrite { .. }
+                            | CanonicalFunction::StreamCancelRead { .. }
+                            | CanonicalFunction::StreamCancelWrite { .. }
+                            | CanonicalFunction::StreamCloseReadable { .. }
+                            | CanonicalFunction::StreamCloseWritable { .. }
+                            | CanonicalFunction::FutureNew { .. }
+                            | CanonicalFunction::FutureRead { .. }
+                            | CanonicalFunction::FutureWrite { .. }
+                            | CanonicalFunction::FutureCancelRead { .. }
+                            | CanonicalFunction::FutureCancelWrite { .. }
+                            | CanonicalFunction::FutureCloseReadable { .. }
+                            | CanonicalFunction::FutureCloseWritable { .. }
+                            | CanonicalFunction::ErrorContextNew { .. }
+                            | CanonicalFunction::ErrorContextDebugMessage { .. }
+                            | CanonicalFunction::ErrorContextDrop => {
+                                ("core func", &mut i.core_funcs)
+                            }
                         };
 
                         write!(me.state, "[{} {}] {:?}", name, inc(col), f)?;
@@ -520,7 +545,7 @@ impl<'a> Dump<'a> {
                                 me.print(pos)
                             })?;
                         }
-                        KnownCustom::Unknown => {
+                        _other => {
                             self.print_byte_header()?;
                             for _ in 0..NBYTES {
                                 write!(self.dst, "---")?;
@@ -530,26 +555,27 @@ impl<'a> Dump<'a> {
                         }
                     }
                 }
-                Payload::UnknownSection {
-                    id,
-                    range,
-                    contents,
-                } => {
-                    write!(self.state, "unknown section: {}", id)?;
-                    self.color_print(range.start)?;
-                    self.print_byte_header()?;
-                    for _ in 0..NBYTES {
-                        write!(self.dst, "---")?;
-                    }
-                    writeln!(self.dst, "-| ... {} bytes of data", contents.len())?;
-                    self.cur += contents.len();
-                }
                 Payload::End(_) => {
                     self.nesting -= 1;
                     if self.nesting > 0 {
                         i = stack.pop().unwrap();
                     }
                 }
+                other => match other.as_section() {
+                    Some((id, range)) => {
+                        write!(self.state, "unknown section: {}", id)?;
+                        self.color_print(range.start)?;
+                        self.print_byte_header()?;
+                        for _ in 0..NBYTES {
+                            write!(self.dst, "---")?;
+                        }
+                        writeln!(self.dst, "-| ... {} bytes of data", range.len())?;
+                        self.cur += range.len();
+                    }
+                    None => {
+                        bail!("unsupported payload {other:?}")
+                    }
+                },
             }
         }
 
@@ -810,7 +836,7 @@ fn inc(spot: &mut u32) -> u32 {
 }
 
 macro_rules! define_visit_operator {
-    ($(@$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident)*) => {
+    ($(@$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident ($($ann:tt)*))*) => {
         $(
             fn $visit(&mut self $($(,$arg: $argty)*)?) {
                 write!(
@@ -830,5 +856,13 @@ macro_rules! define_visit_operator {
 impl<'a> VisitOperator<'a> for Dump<'_> {
     type Output = ();
 
-    wasmparser::for_each_operator!(define_visit_operator);
+    fn simd_visitor(&mut self) -> Option<&mut dyn VisitSimdOperator<'a, Output = Self::Output>> {
+        Some(self)
+    }
+
+    wasmparser::for_each_visit_operator!(define_visit_operator);
+}
+
+impl<'a> VisitSimdOperator<'a> for Dump<'_> {
+    wasmparser::for_each_visit_simd_operator!(define_visit_operator);
 }

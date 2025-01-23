@@ -105,7 +105,8 @@ impl<'a> Cloner<'a> {
             TypeDefKind::Type(_)
             | TypeDefKind::Resource
             | TypeDefKind::Flags(_)
-            | TypeDefKind::Enum(_) => {}
+            | TypeDefKind::Enum(_)
+            | TypeDefKind::ErrorContext => {}
             TypeDefKind::Handle(Handle::Own(ty) | Handle::Borrow(ty)) => {
                 self.type_id(ty);
             }
@@ -137,12 +138,11 @@ impl<'a> Cloner<'a> {
                     self.ty(err);
                 }
             }
-            TypeDefKind::Future(f) => {
-                if let Some(ty) = f {
+            TypeDefKind::Future(ty) | TypeDefKind::Stream(ty) => {
+                if let Some(ty) = ty {
                     self.ty(ty);
                 }
             }
-            TypeDefKind::Stream(_) => unimplemented!(),
             TypeDefKind::Unknown => {}
         }
     }

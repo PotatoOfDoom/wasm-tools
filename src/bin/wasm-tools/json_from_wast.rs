@@ -54,7 +54,7 @@ pub struct Opts {
     ///
     /// This is defaulted to `true` to enable parsing all upstream spec tests
     /// but can be disabled if desired too.
-    #[clap(long)]
+    #[clap(long, value_name = "true|false")]
     allow_confusing_unicode: Option<bool>,
 }
 
@@ -252,6 +252,15 @@ impl<'a> JsonBuilder<'a> {
                 line,
                 action: self.action(exec)?,
             },
+            WastDirective::AssertSuspension {
+                span: _,
+                exec,
+                message,
+            } => json::Command::AssertSuspension {
+                line,
+                text: message,
+                action: self.action(exec)?,
+            },
             WastDirective::Thread(thread) => json::Command::Thread {
                 line,
                 name: thread.name.name(),
@@ -353,7 +362,7 @@ impl<'a> JsonBuilder<'a> {
         for arg in args {
             let arg = match arg {
                 WastArg::Core(core) => core,
-                WastArg::Component(_) => bail!("component support not implemented yet"),
+                _ => bail!("encountered unsupported Wast argument: {arg:?}"),
             };
             let val = match arg {
                 I32(i) => json::Const::I32 {
@@ -410,7 +419,7 @@ impl<'a> JsonBuilder<'a> {
         for r in rets {
             let r = match r {
                 WastRet::Core(core) => self.core_ret(core)?,
-                WastRet::Component(_) => bail!("component support not implemented yet"),
+                _ => bail!("encountered unsupported Wast result: {r:?}"),
             };
             ret.push(r);
         }
@@ -553,6 +562,10 @@ fn null_heap_ty(ty: HeapType<'_>) -> Result<json::Const> {
                 Array => json::Const::ArrayRef,
                 I31 => json::Const::I31Ref,
                 NoExn => json::Const::NullExnRef,
+                Cont => json::Const::ContRef {
+                    value: Some("null".to_string()),
+                },
+                NoCont => json::Const::NullContRef,
             }
         }
         _ => bail!("unsupported heap type found in `ref.null`"),
@@ -639,6 +652,11 @@ mod json {
         AssertException {
             line: u32,
             action: Action<'a>,
+        },
+        AssertSuspension {
+            line: u32,
+            action: Action<'a>,
+            text: &'a str,
         },
         AssertUninstantiable {
             line: u32,
@@ -734,6 +752,13 @@ mod json {
             #[serde(skip_serializing_if = "Option::is_none")]
             value: Option<String>,
         },
+
+        ContRef {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            value: Option<String>,
+        },
+
+        NullContRef,
 
         // any null reference, type doesn't matter
         RefNull,

@@ -81,7 +81,7 @@ fn run_test(test: &Path, bless: bool) -> Result<()> {
             }
         }
 
-        match commands.insert(name, (cmd, should_fail)) {
+        match commands.insert(name, (cmd, should_fail, i)) {
             Some(_) => bail!("line {i}: duplicate directive named {name:?}"),
             None => {}
         }
@@ -92,44 +92,62 @@ fn run_test(test: &Path, bless: bool) -> Result<()> {
     }
     let exe = Path::new(env!("CARGO_BIN_EXE_wasm-tools"));
     let tempdir = TempDir::new_in(exe.parent().unwrap())?;
-    for (name, (line, should_fail)) in commands {
-        let mut cmd = Command::new(exe);
-        let mut stdin = None;
-        for arg in line.split_whitespace() {
-            let arg = arg.replace("%tmpdir", tempdir.path().to_str().unwrap());
-            if arg == "|" {
-                let output = execute(&mut cmd, stdin.as_deref(), false)?;
-                stdin = Some(output.stdout);
-                cmd = Command::new(exe);
-            } else if arg == "%" {
-                cmd.arg(test);
-            } else {
-                cmd.arg(arg);
-            }
-        }
-
-        let output = execute(&mut cmd, stdin.as_deref(), should_fail)?;
-        let extension = test.extension().unwrap().to_str().unwrap();
-        let extension = if name.is_empty() {
-            extension.to_string()
-        } else {
-            format!("{extension}.{name}")
-        };
-        assert_output(
-            bless,
-            &output.stdout,
-            &test.with_extension(&format!("{extension}.stdout")),
-            &tempdir,
-        )
-        .context("failed to check stdout expectation (auto-update with BLESS=1)")?;
-        assert_output(
-            bless,
-            &output.stderr,
-            &test.with_extension(&format!("{extension}.stderr")),
-            &tempdir,
-        )
-        .context("failed to check stderr expectation (auto-update with BLESS=1)")?;
+    for (name, (line, should_fail, i)) in commands {
+        run_test_directive(test, &name, &line, bless, should_fail, exe, &tempdir).with_context(
+            || {
+                let kind = if should_fail { "FAIL" } else { "RUN" };
+                format!("failed {kind} directive `{name}` on line {i}")
+            },
+        )?;
     }
+    Ok(())
+}
+
+fn run_test_directive(
+    test: &Path,
+    name: &str,
+    line: &str,
+    bless: bool,
+    should_fail: bool,
+    exe: &Path,
+    tempdir: &TempDir,
+) -> Result<()> {
+    let mut cmd = Command::new(exe);
+    let mut stdin = None;
+    for arg in line.split_whitespace() {
+        let arg = arg.replace("%tmpdir", tempdir.path().to_str().unwrap());
+        if arg == "|" {
+            let output = execute(&mut cmd, stdin.as_deref(), false)?;
+            stdin = Some(output.stdout);
+            cmd = Command::new(exe);
+        } else if arg == "%" {
+            cmd.arg(test);
+        } else {
+            cmd.arg(arg);
+        }
+    }
+
+    let output = execute(&mut cmd, stdin.as_deref(), should_fail)?;
+    let extension = test.extension().unwrap().to_str().unwrap();
+    let extension = if name.is_empty() {
+        extension.to_string()
+    } else {
+        format!("{extension}.{name}")
+    };
+    assert_output(
+        bless,
+        &output.stdout,
+        &test.with_extension(&format!("{extension}.stdout")),
+        &tempdir,
+    )
+    .context("failed to check stdout expectation (auto-update with BLESS=1)")?;
+    assert_output(
+        bless,
+        &output.stderr,
+        &test.with_extension(&format!("{extension}.stderr")),
+        &tempdir,
+    )
+    .context("failed to check stderr expectation (auto-update with BLESS=1)")?;
     Ok(())
 }
 
@@ -143,11 +161,13 @@ fn execute(cmd: &mut Command, stdin: Option<&[u8]>, should_fail: bool) -> Result
 
     let mut io = p.stdin.take().unwrap();
     if let Some(stdin) = stdin {
-        io.write_all(stdin)?;
+        io.write_all(stdin).context("failed to write to stdin")?;
     }
     drop(io);
 
-    let output = p.wait_with_output()?;
+    let output = p
+        .wait_with_output()
+        .context("failed to wait for process exit")?;
 
     let mut failure = None;
     match output.status.code() {
@@ -181,10 +201,29 @@ fn execute(cmd: &mut Command, stdin: Option<&[u8]>, should_fail: bool) -> Result
 fn assert_output(bless: bool, output: &[u8], path: &Path, tempdir: &TempDir) -> Result<()> {
     let tempdir = tempdir.path().to_str().unwrap();
     // sanitize the output to be consistent across platforms and handle per-test
-    // differences such as `%tmpdir`.
-    let output = String::from_utf8_lossy(output)
+    // differences such as `%tmpdir`, as well as the version number of the crate being
+    // tested in the producers custom section.
+    let mut output = String::from_utf8_lossy(output)
         .replace(tempdir, "%tmpdir")
-        .replace("\\", "/");
+        .replace("\\", "/")
+        .lines()
+        .map(|line| {
+            if let Some(start) = line.find("(processed-by \"wit-component\"") {
+                let (before, _) = line.split_at(start);
+                format!("{before}(processed-by \"wit-component\" \"%version\")")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+        .trim_end()
+        .to_string();
+
+    // Leave a single trailing newline on all test outputs
+    if !output.is_empty() {
+        output.push_str("\n");
+    }
 
     if bless {
         if output.is_empty() {

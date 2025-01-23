@@ -13,9 +13,10 @@ use wasmparser::types::{CoreTypeId, EntityType, Types};
 use wasmparser::{Payload, ValidPayload};
 use wat::Detect;
 use wit_component::{
-    embed_component_metadata, ComponentEncoder, DecodedWasm, Linker, StringEncoding, WitPrinter,
+    embed_component_metadata, metadata, ComponentEncoder, DecodedWasm, Linker, StringEncoding,
+    WitPrinter,
 };
-use wit_parser::{PackageId, Resolve};
+use wit_parser::{LiftLowerAbi, Mangling, ManglingAndAbi, PackageId, Resolve};
 
 /// WebAssembly wit-based component tooling.
 #[derive(Parser)]
@@ -141,6 +142,24 @@ pub struct NewOpts {
     /// Use memory.grow to realloc memory and stack allocation.
     #[clap(long)]
     realloc_via_memory_grow: bool,
+
+    /// Indicates whether imports into the final component are merged based on
+    /// semver ranges.
+    ///
+    /// This is enabled by default.
+    #[clap(long, value_name = "MERGE")]
+    merge_imports_based_on_semver: Option<bool>,
+
+    /// Reject usage of the "legacy" naming scheme of `wit-component` and
+    /// require the new naming scheme to be used.
+    ///
+    /// This flag can be used to ignore core module imports/exports that don't
+    /// conform to WebAssembly/component-model#378. This turns off
+    /// compatibility `wit-component`'s historical naming scheme. This is
+    /// intended to be used to test if a tool is compatible with a hypothetical
+    /// removal of the old scheme in the future.
+    #[clap(long)]
+    reject_legacy_names: bool,
 }
 
 impl NewOpts {
@@ -153,7 +172,12 @@ impl NewOpts {
         let wasm = self.io.parse_input_wasm()?;
         let mut encoder = ComponentEncoder::default()
             .validate(!self.skip_validation)
-            .module(&wasm)?;
+            .reject_legacy_names(self.reject_legacy_names);
+
+        if let Some(merge) = self.merge_imports_based_on_semver {
+            encoder = encoder.merge_imports_based_on_semver(merge);
+        }
+        encoder = encoder.module(&wasm)?;
 
         for (name, wasm) in self.adapters.iter() {
             encoder = encoder.adapter(name, wasm)?;
@@ -268,12 +292,52 @@ pub struct EmbedOpts {
     /// imports/exports and the right signatures for the component model. This
     /// can be useful to, perhaps, inspect a template module and what it looks
     /// like to work with an interface in the component model.
-    #[clap(long)]
+    ///
+    /// This option is equivalent to `--dummy-names standard32`
+    #[clap(long, conflicts_with = "dummy_names")]
     dummy: bool,
+
+    /// Same as `--dummy`, but the style of core wasm names is specified.
+    ///
+    /// This flag is the same as `--dummy` where if specified a core wasm module
+    /// is not read but is instead generated. The value of the option here is
+    /// the name mangling scheme to use for core wasm names generated. Current
+    /// options are `legacy|standard32`.
+    #[clap(long, conflicts_with = "dummy")]
+    dummy_names: Option<Mangling>,
+
+    /// With `--dummy-names legacy`, this will generate a core module such that
+    /// all the imports are lowered using the async ABI and the exports are
+    /// lifted using the async-with-callback ABI.
+    ///
+    /// Note that this does not yet work with `--dummy` or `--dummy-names
+    /// standard32` because the standard name mangling scheme does not yet
+    /// support async-related features as of this writing.
+    #[clap(long, requires = "dummy_names", conflicts_with = "async_stackful")]
+    async_callback: bool,
+
+    /// With `--dummy-names legacy`, this will generate a core module such that
+    /// all the imports are lowered using the async ABI and the exports are
+    /// lifted using the async-without-callback (i.e. stackful) ABI.
+    ///
+    /// Note that this does not yet work with `--dummy` or `--dummy-names
+    /// standard32` because the standard name mangling scheme does not yet
+    /// support async-related features as of this writing.
+    #[clap(long, requires = "dummy_names", conflicts_with = "async_callback")]
+    async_stackful: bool,
 
     /// Print the output in the WebAssembly text format instead of binary.
     #[clap(long, short = 't')]
     wat: bool,
+
+    /// Print the wasm custom section only.
+    #[clap(
+        long,
+        conflicts_with = "wat",
+        conflicts_with = "dummy",
+        conflicts_with = "dummy_names"
+    )]
+    only_custom: bool,
 }
 
 impl EmbedOpts {
@@ -283,14 +347,47 @@ impl EmbedOpts {
 
     /// Executes the application.
     fn run(self) -> Result<()> {
-        let wasm = if self.dummy {
-            None
-        } else {
-            Some(self.io.parse_input_wasm()?)
-        };
         let (resolve, pkg_id) = self.resolve.load()?;
+
         let world = resolve.select_world(pkg_id, self.world.as_deref())?;
-        let mut wasm = wasm.unwrap_or_else(|| wit_component::dummy_module(&resolve, world));
+
+        if self.only_custom {
+            let encoded = metadata::encode(
+                &resolve,
+                world,
+                self.encoding.unwrap_or(StringEncoding::UTF8),
+                None,
+            )?;
+
+            self.io.output_wasm(&encoded, false)?;
+            return Ok(());
+        }
+
+        let mut wasm = if self.dummy {
+            wit_component::dummy_module(&resolve, world, ManglingAndAbi::Standard32)
+        } else if let Some(mangling) = self.dummy_names {
+            wit_component::dummy_module(
+                &resolve,
+                world,
+                match mangling {
+                    Mangling::Standard32 => {
+                        if self.async_callback || self.async_stackful {
+                            bail!("non-legacy mangling not yet supported when generating async dummy modules");
+                        }
+                        ManglingAndAbi::Standard32
+                    }
+                    Mangling::Legacy => ManglingAndAbi::Legacy(if self.async_callback {
+                        LiftLowerAbi::AsyncCallback
+                    } else if self.async_stackful {
+                        LiftLowerAbi::AsyncStackful
+                    } else {
+                        LiftLowerAbi::Sync
+                    }),
+                },
+            )
+        } else {
+            self.io.parse_input_wasm()?
+        };
 
         embed_component_metadata(
             &mut wasm,
@@ -392,6 +489,13 @@ pub struct LinkOpts {
     /// Use built-in implementations of `dlopen`/`dlsym`
     #[clap(long)]
     use_built_in_libdl: bool,
+
+    /// Indicates whether imports into the final component are merged based on
+    /// semver ranges.
+    ///
+    /// This is enabled by default.
+    #[clap(long, value_name = "MERGE")]
+    merge_imports_based_on_semver: Option<bool>,
 }
 
 impl LinkOpts {
@@ -408,6 +512,10 @@ impl LinkOpts {
 
         if let Some(stack_size) = self.stack_size {
             linker = linker.stack_size(stack_size);
+        }
+
+        if let Some(merge) = self.merge_imports_based_on_semver {
+            linker = linker.merge_imports_based_on_semver(merge);
         }
 
         for (name, wasm) in &self.inputs {
@@ -508,7 +616,11 @@ pub struct WitOpts {
     /// of the component which is input.
     ///
     /// This is similar to `--importize-world`, but is used with components.
-    #[clap(long, conflicts_with = "importize_world")]
+    #[clap(
+        long,
+        conflicts_with = "importize_world",
+        conflicts_with = "merge_world_imports_based_on_semver"
+    )]
     importize: bool,
 
     /// The name of the world to generate when using `--importize` or `importize-world`.
@@ -525,8 +637,28 @@ pub struct WitOpts {
     /// to imports.
     ///
     /// This is similar to `--importize`, but is used with WIT packages.
-    #[clap(long, conflicts_with = "importize", value_name = "WORLD")]
+    #[clap(
+        long,
+        conflicts_with = "importize",
+        conflicts_with = "merge_world_imports_based_on_semver",
+        value_name = "WORLD"
+    )]
     importize_world: Option<String>,
+
+    /// Updates the world specified to deduplicate all of its imports based on
+    /// semver versions.
+    ///
+    /// This option can be used to read a WIT world from a package and update it
+    /// to deduplicate WIT imports based on their version. This happens by
+    /// default in the `component new` subcommand for example and this flag can
+    /// be used to explore outside of that command what's happening to the WIT.
+    #[clap(
+        long,
+        conflicts_with = "importize",
+        conflicts_with = "importize_world",
+        value_name = "WORLD"
+    )]
+    merge_world_imports_based_on_semver: Option<String>,
 
     /// Features to enable when parsing the `wit` option.
     ///
@@ -560,6 +692,24 @@ impl WitOpts {
                 self.importize_world.as_deref(),
                 self.importize_out_world_name.as_ref(),
             )?;
+        } else if let Some(world) = &self.merge_world_imports_based_on_semver {
+            let (resolve, world_id) = match &mut decoded {
+                DecodedWasm::Component(..) => {
+                    bail!(
+                        "the `--merge-world-imports-based-on-semver` flag is \
+                        not compatible with a component input"
+                    );
+                }
+                DecodedWasm::WitPackage(resolve, id) => {
+                    let world = resolve.select_world(*id, Some(world))?;
+                    (resolve, world)
+                }
+            };
+            resolve
+                .merge_world_imports_based_on_semver(world_id)
+                .context("failed to merge world imports based on semver")?;
+            let resolve = mem::take(resolve);
+            decoded = DecodedWasm::Component(resolve, world_id);
         }
 
         // Now that the WIT document has been decoded, it's time to emit it.
@@ -663,8 +813,6 @@ impl WitOpts {
                 (resolve, world)
             }
         };
-        // let pkg = decoded.package();
-        // let world_id = decoded.resolve().select_world(main, None)?;
         resolve
             .importize(world_id, out_world_name.cloned())
             .context("failed to move world exports to imports")?;
@@ -691,8 +839,11 @@ impl WitOpts {
 
         let resolve = decoded.resolve();
 
-        let mut printer = WitPrinter::default();
-        printer.emit_docs(!self.no_docs);
+        let configure_printer = || {
+            let mut wit_printer = WitPrinter::default();
+            wit_printer.emit_docs(!self.no_docs);
+            wit_printer
+        };
 
         match &self.out_dir {
             Some(dir) => {
@@ -715,7 +866,9 @@ impl WitOpts {
                 let main = decoded.package();
                 for (id, pkg) in resolve.packages.iter() {
                     let is_main = id == main;
-                    let output = printer.print(resolve, id, &[])?;
+                    let mut printer = configure_printer();
+                    printer.print(resolve, id, &[])?;
+                    let output = printer.output.to_string();
                     let out_dir = if is_main {
                         dir.clone()
                     } else {
@@ -754,7 +907,7 @@ impl WitOpts {
                     &self.general,
                     Output::Wit {
                         wit: &decoded,
-                        printer,
+                        printer: configure_printer(),
                     },
                 )?;
             }
@@ -937,6 +1090,7 @@ impl UnbundleOpts {
             // create an import corresponding to that module in the import
             // section.
             let mut module_ty = ModuleTypeCreator::new(&mut core_types, &types);
+            let types = types.as_ref();
 
             for (module, name, ty) in types.core_imports().unwrap() {
                 let ty = module_ty.convert_entity_type(ty)?;

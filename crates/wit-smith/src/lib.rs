@@ -6,7 +6,7 @@
 //! type structures.
 
 use arbitrary::{Result, Unstructured};
-use wit_parser::Resolve;
+use wit_parser::{InvalidTransitiveDependency, Resolve};
 
 mod config;
 pub use self::config::Config;
@@ -17,7 +17,7 @@ mod generate;
 /// The `config` guides the generation of the document and the `u` bytes are
 /// used as input to construct the document.
 pub fn smith(config: &Config, u: &mut Unstructured<'_>) -> Result<Vec<u8>> {
-    let pkgs = generate::Generator::new(config.clone()).gen(u)?;
+    let pkgs = generate::Generator::new(config.clone()).generate(u)?;
     let mut resolve = Resolve::default();
     let mut last = None;
     for pkg in pkgs {
@@ -25,10 +25,7 @@ pub fn smith(config: &Config, u: &mut Unstructured<'_>) -> Result<Vec<u8>> {
         let id = match resolve.push_group(group) {
             Ok(id) => id,
             Err(e) => {
-                if e.to_string().contains(
-                    "interface transitively depends on an interface in \
-                     incompatible ways",
-                ) {
+                if e.is::<InvalidTransitiveDependency>() {
                     return Err(arbitrary::Error::IncorrectFormat);
                 }
                 panic!("bad wit parse: {e:?}")

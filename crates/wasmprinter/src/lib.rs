@@ -9,6 +9,7 @@
 #![deny(missing_docs)]
 
 use anyhow::{anyhow, bail, Context, Result};
+use operator::{OpPrinter, OperatorSeparator, OperatorState, PrintOperator, PrintOperatorFolded};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
@@ -22,6 +23,8 @@ const MAX_NESTING_TO_PRINT: u32 = 50;
 const MAX_WASM_FUNCTIONS: u32 = 1_000_000;
 const MAX_WASM_FUNCTION_SIZE: u32 = 128 * 1024;
 
+#[cfg(feature = "component-model")]
+mod component;
 mod operator;
 mod print;
 
@@ -47,11 +50,25 @@ pub fn print_bytes(wasm: impl AsRef<[u8]>) -> Result<String> {
 ///
 /// This structure is used to control the overal structure of how wasm binaries
 /// are printed and tweaks various ways that configures the output.
-#[derive(Default)]
+#[derive(Debug)]
 pub struct Config {
     print_offsets: bool,
     print_skeleton: bool,
     name_unnamed: bool,
+    fold_instructions: bool,
+    indent_text: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            print_offsets: false,
+            print_skeleton: false,
+            name_unnamed: false,
+            fold_instructions: false,
+            indent_text: "  ".to_string(),
+        }
+    }
 }
 
 /// This structure is the actual structure that prints WebAssembly binaries.
@@ -68,11 +85,15 @@ struct Printer<'cfg, 'env> {
 struct CoreState {
     types: Vec<Option<SubType>>,
     funcs: u32,
+    func_to_type: Vec<Option<u32>>,
     memories: u32,
     tags: u32,
+    tag_to_type: Vec<Option<u32>>,
     globals: u32,
     tables: u32,
+    #[cfg(feature = "component-model")]
     modules: u32,
+    #[cfg(feature = "component-model")]
     instances: u32,
     func_names: NamingMap<u32, NameFunc>,
     local_names: NamingMap<(u32, u32), NameLocal>,
@@ -85,7 +106,9 @@ struct CoreState {
     global_names: NamingMap<u32, NameGlobal>,
     element_names: NamingMap<u32, NameElem>,
     data_names: NamingMap<u32, NameData>,
+    #[cfg(feature = "component-model")]
     module_names: NamingMap<u32, NameModule>,
+    #[cfg(feature = "component-model")]
     instance_names: NamingMap<u32, NameInstance>,
 }
 
@@ -113,6 +136,7 @@ impl<T, K> Default for NamingMap<T, K> {
 }
 
 #[derive(Default)]
+#[cfg(feature = "component-model")]
 struct ComponentState {
     types: u32,
     funcs: u32,
@@ -130,6 +154,7 @@ struct State {
     encoding: Encoding,
     name: Option<Naming>,
     core: CoreState,
+    #[cfg(feature = "component-model")]
     component: ComponentState,
     custom_section_place: Option<&'static str>,
 }
@@ -140,6 +165,7 @@ impl State {
             encoding,
             name: None,
             core: CoreState::default(),
+            #[cfg(feature = "component-model")]
             component: ComponentState::default(),
             custom_section_place: None,
         }
@@ -166,14 +192,16 @@ impl Config {
 
     /// Whether or not to print binary offsets of each item as comments in the
     /// text format whenever a newline is printed.
-    pub fn print_offsets(&mut self, print: bool) {
+    pub fn print_offsets(&mut self, print: bool) -> &mut Self {
         self.print_offsets = print;
+        self
     }
 
     /// Whether or not to print only a "skeleton" which skips function bodies,
     /// data segment contents, element segment contents, etc.
-    pub fn print_skeleton(&mut self, print: bool) {
+    pub fn print_skeleton(&mut self, print: bool) -> &mut Self {
         self.print_skeleton = print;
+        self
     }
 
     /// Assign names to all unnamed items.
@@ -186,8 +214,40 @@ impl Config {
     ///
     /// Note that if the resulting text output is converted back to binary the
     /// resulting `name` custom section will not be the same as before.
-    pub fn name_unnamed(&mut self, enable: bool) {
+    pub fn name_unnamed(&mut self, enable: bool) -> &mut Self {
         self.name_unnamed = enable;
+        self
+    }
+
+    /// Print instructions in folded form where possible.
+    ///
+    /// This will cause printing to favor the s-expression (parenthesized) form
+    /// of WebAssembly instructions. For example this output would be generated
+    /// for a simple `add` function:
+    ///
+    /// ```wasm
+    /// (module
+    ///     (func $foo (param i32 i32) (result i32)
+    ///         (i32.add
+    ///             (local.get 0)
+    ///             (local.get 1))
+    ///     )
+    /// )
+    /// ```
+    pub fn fold_instructions(&mut self, enable: bool) -> &mut Self {
+        self.fold_instructions = enable;
+        self
+    }
+
+    /// Select the string to use when indenting.
+    ///
+    /// The indent allowed here are arbitrary and unchecked. You should enter
+    /// blank text like `" "` or `"\t"`, rather than something like `"(;;)"`.
+    ///
+    /// The default setting is double spaces `" "`
+    pub fn indent_text(&mut self, text: impl Into<String>) -> &mut Self {
+        self.indent_text = text.into();
+        self
     }
 
     /// Prints a WebAssembly binary into a `String`
@@ -281,6 +341,7 @@ impl Printer<'_, '_> {
                     bytes = &bytes[size as usize..];
                     parser.skip_section();
                 }
+                #[cfg(feature = "component-model")]
                 Payload::ModuleSection {
                     unchecked_range: range,
                     ..
@@ -302,6 +363,7 @@ impl Printer<'_, '_> {
                         KnownCustom::Name(reader) => {
                             drop(self.register_names(state, reader));
                         }
+                        #[cfg(feature = "component-model")]
                         KnownCustom::ComponentName(reader) => {
                             drop(self.register_component_names(state, reader));
                         }
@@ -328,6 +390,7 @@ impl Printer<'_, '_> {
         Ok(())
     }
 
+    #[cfg(feature = "component-model")]
     fn ensure_component(states: &[State]) -> Result<()> {
         if !matches!(states.last().unwrap().encoding, Encoding::Component) {
             bail!("a component section was encountered when parsing a module");
@@ -342,8 +405,8 @@ impl Printer<'_, '_> {
         let mut expected = None;
         let mut states: Vec<State> = Vec::new();
         let mut parser = Parser::new(0);
+        #[cfg(feature = "component-model")]
         let mut parsers = Vec::new();
-        let mut func_reader = None;
 
         loop {
             let payload = match parser.parse(bytes, true)? {
@@ -374,6 +437,7 @@ impl Printer<'_, '_> {
                                 self.start_group("module")?;
                             }
 
+                            #[cfg(feature = "component-model")]
                             if states.len() > 1 {
                                 let parent = &states[states.len() - 2];
                                 self.result.write_str(" ")?;
@@ -381,16 +445,26 @@ impl Printer<'_, '_> {
                             }
                         }
                         Encoding::Component => {
-                            states.push(State::new(Encoding::Component));
-                            self.start_group("component")?;
+                            #[cfg(feature = "component-model")]
+                            {
+                                states.push(State::new(Encoding::Component));
+                                self.start_group("component")?;
 
-                            if states.len() > 1 {
-                                let parent = &states[states.len() - 2];
-                                self.result.write_str(" ")?;
-                                self.print_name(
-                                    &parent.component.component_names,
-                                    parent.component.components,
-                                )?;
+                                if states.len() > 1 {
+                                    let parent = &states[states.len() - 2];
+                                    self.result.write_str(" ")?;
+                                    self.print_name(
+                                        &parent.component.component_names,
+                                        parent.component.components,
+                                    )?;
+                                }
+                            }
+                            #[cfg(not(feature = "component-model"))]
+                            {
+                                bail!(
+                                    "support for printing components disabled \
+                                     at compile-time"
+                                );
                             }
                         }
                     }
@@ -466,7 +540,9 @@ impl Printer<'_, '_> {
                             MAX_WASM_FUNCTIONS
                         );
                     }
-                    func_reader = Some(reader.into_iter());
+                    for ty in reader {
+                        states.last_mut().unwrap().core.func_to_type.push(Some(ty?))
+                    }
                 }
                 Payload::TableSection(s) => {
                     self.update_custom_section_place(&mut states, "after table");
@@ -511,11 +587,7 @@ impl Printer<'_, '_> {
                     Self::ensure_module(&states)?;
                 }
                 Payload::CodeSectionEntry(body) => {
-                    if let Some(ref mut reader) = func_reader {
-                        if let Some(Ok(ty)) = reader.next() {
-                            self.print_code_section_entry(states.last_mut().unwrap(), &body, ty)?
-                        }
-                    }
+                    self.print_code_section_entry(states.last_mut().unwrap(), &body)?
                 }
                 Payload::DataCountSection { .. } => {
                     Self::ensure_module(&states)?;
@@ -527,6 +599,7 @@ impl Printer<'_, '_> {
                     self.print_data(states.last_mut().unwrap(), s)?;
                 }
 
+                #[cfg(feature = "component-model")]
                 Payload::ModuleSection {
                     parser: inner,
                     unchecked_range: range,
@@ -537,11 +610,14 @@ impl Printer<'_, '_> {
                     parser = inner;
                     self.newline(range.start)?;
                 }
+                #[cfg(feature = "component-model")]
                 Payload::InstanceSection(s) => {
                     Self::ensure_component(&states)?;
                     self.print_instances(states.last_mut().unwrap(), s)?;
                 }
+                #[cfg(feature = "component-model")]
                 Payload::CoreTypeSection(s) => self.print_core_types(&mut states, s)?,
+                #[cfg(feature = "component-model")]
                 Payload::ComponentSection {
                     parser: inner,
                     unchecked_range: range,
@@ -552,30 +628,37 @@ impl Printer<'_, '_> {
                     parser = inner;
                     self.newline(range.start)?;
                 }
+                #[cfg(feature = "component-model")]
                 Payload::ComponentInstanceSection(s) => {
                     Self::ensure_component(&states)?;
                     self.print_component_instances(states.last_mut().unwrap(), s)?;
                 }
+                #[cfg(feature = "component-model")]
                 Payload::ComponentAliasSection(s) => {
                     Self::ensure_component(&states)?;
                     self.print_component_aliases(&mut states, s)?;
                 }
+                #[cfg(feature = "component-model")]
                 Payload::ComponentTypeSection(s) => {
                     Self::ensure_component(&states)?;
                     self.print_component_types(&mut states, s)?;
                 }
+                #[cfg(feature = "component-model")]
                 Payload::ComponentCanonicalSection(s) => {
                     Self::ensure_component(&states)?;
                     self.print_canonical_functions(states.last_mut().unwrap(), s)?;
                 }
+                #[cfg(feature = "component-model")]
                 Payload::ComponentStartSection { start, range } => {
                     Self::ensure_component(&states)?;
                     self.print_component_start(states.last_mut().unwrap(), range.start, start)?;
                 }
+                #[cfg(feature = "component-model")]
                 Payload::ComponentImportSection(s) => {
                     Self::ensure_component(&states)?;
                     self.print_component_imports(states.last_mut().unwrap(), s)?;
                 }
+                #[cfg(feature = "component-model")]
                 Payload::ComponentExportSection(s) => {
                     Self::ensure_component(&states)?;
                     self.print_component_exports(states.last_mut().unwrap(), s)?;
@@ -584,27 +667,33 @@ impl Printer<'_, '_> {
                 Payload::End(offset) => {
                     self.end_group()?; // close the `module` or `component` group
 
-                    let state = states.pop().unwrap();
-                    if let Some(parent) = states.last_mut() {
-                        match state.encoding {
-                            Encoding::Module => {
-                                parent.core.modules += 1;
+                    #[cfg(feature = "component-model")]
+                    {
+                        let state = states.pop().unwrap();
+                        if let Some(parent) = states.last_mut() {
+                            match state.encoding {
+                                Encoding::Module => {
+                                    parent.core.modules += 1;
+                                }
+                                Encoding::Component => {
+                                    parent.component.components += 1;
+                                }
                             }
-                            Encoding::Component => {
-                                parent.component.components += 1;
-                            }
+                            parser = parsers.pop().unwrap();
+                            continue;
                         }
-                        parser = parsers.pop().unwrap();
-                    } else {
-                        self.newline(offset)?;
-                        if self.config.print_offsets {
-                            self.result.newline()?;
-                        }
-                        break;
                     }
+                    self.newline(offset)?;
+                    if self.config.print_offsets {
+                        self.result.newline()?;
+                    }
+                    break;
                 }
 
-                Payload::UnknownSection { id, .. } => bail!("found unknown section `{}`", id),
+                other => match other.as_section() {
+                    Some((id, _)) => bail!("found unknown section `{}`", id),
+                    None => bail!("found unknown payload"),
+                },
             }
         }
 
@@ -688,72 +777,6 @@ impl Printer<'_, '_> {
         Ok(())
     }
 
-    fn register_component_names(
-        &mut self,
-        state: &mut State,
-        names: ComponentNameSectionReader<'_>,
-    ) -> Result<()> {
-        for section in names {
-            match section? {
-                ComponentName::Component { name, .. } => {
-                    let name = Naming::new(name, 0, "component", None);
-                    state.name = Some(name);
-                }
-                ComponentName::CoreFuncs(n) => {
-                    name_map(&mut state.core.func_names, n, "core-func")?
-                }
-                ComponentName::CoreTypes(n) => {
-                    name_map(&mut state.core.type_names, n, "core-type")?
-                }
-                ComponentName::CoreTables(n) => {
-                    name_map(&mut state.core.table_names, n, "core-table")?
-                }
-                ComponentName::CoreMemories(n) => {
-                    name_map(&mut state.core.memory_names, n, "core-memory")?
-                }
-                ComponentName::CoreGlobals(n) => {
-                    name_map(&mut state.core.global_names, n, "core-global")?
-                }
-                ComponentName::CoreModules(n) => {
-                    name_map(&mut state.core.module_names, n, "core-module")?
-                }
-                ComponentName::CoreInstances(n) => {
-                    name_map(&mut state.core.instance_names, n, "core-instance")?
-                }
-                ComponentName::Types(n) => name_map(&mut state.component.type_names, n, "type")?,
-                ComponentName::Instances(n) => {
-                    name_map(&mut state.component.instance_names, n, "instance")?
-                }
-                ComponentName::Components(n) => {
-                    name_map(&mut state.component.component_names, n, "component")?
-                }
-                ComponentName::Funcs(n) => name_map(&mut state.component.func_names, n, "func")?,
-                ComponentName::Values(n) => name_map(&mut state.component.value_names, n, "value")?,
-                ComponentName::Unknown { .. } => (),
-            }
-        }
-        Ok(())
-    }
-
-    fn print_core_type(&mut self, states: &mut Vec<State>, ty: CoreType) -> Result<()> {
-        match ty {
-            CoreType::Rec(rec) => {
-                self.print_rec(states.last_mut().unwrap(), None, rec, true)?;
-            }
-            CoreType::Module(decls) => {
-                self.start_group("core type ")?;
-                self.print_name(
-                    &states.last().unwrap().core.type_names,
-                    states.last().unwrap().core.types.len() as u32,
-                )?;
-                self.print_module_type(states, decls.into_vec())?;
-                self.end_group()?; // `core type` itself
-                states.last_mut().unwrap().core.types.push(None);
-            }
-        }
-        Ok(())
-    }
-
     fn print_rec(
         &mut self,
         state: &mut State,
@@ -814,6 +837,7 @@ impl Printer<'_, '_> {
     fn print_composite(&mut self, state: &State, ty: &CompositeType, ty_idx: u32) -> Result<u32> {
         if ty.shared {
             self.start_group("shared")?;
+            self.result.write_str(" ")?;
         }
         let r = match &ty.inner {
             CompositeInnerType::Func(ty) => {
@@ -834,25 +858,17 @@ impl Printer<'_, '_> {
                 self.end_group()?; // `struct`
                 r
             }
+            CompositeInnerType::Cont(ty) => {
+                self.start_group("cont")?;
+                let r = self.print_cont_type(state, ty)?;
+                self.end_group()?; // `cont`
+                r
+            }
         };
         if ty.shared {
             self.end_group()?; // `shared`
         }
         Ok(r)
-    }
-
-    fn print_core_types(
-        &mut self,
-        states: &mut Vec<State>,
-        parser: CoreTypeSectionReader<'_>,
-    ) -> Result<()> {
-        for ty in parser.into_iter_with_offsets() {
-            let (offset, ty) = ty?;
-            self.newline(offset)?;
-            self.print_core_type(states, ty)?;
-        }
-
-        Ok(())
     }
 
     fn print_types(&mut self, state: &mut State, parser: TypeSectionReader<'_>) -> Result<()> {
@@ -959,6 +975,12 @@ impl Printer<'_, '_> {
         Ok(0)
     }
 
+    fn print_cont_type(&mut self, state: &State, ct: &ContType) -> Result<u32> {
+        self.result.write_str(" ")?;
+        self.print_idx(&state.core.type_names, ct.0.as_module_index().unwrap())?;
+        Ok(0)
+    }
+
     fn print_sub_type(&mut self, state: &State, ty: &SubType) -> Result<u32> {
         self.result.write_str(" ")?;
         if ty.is_final {
@@ -1045,6 +1067,8 @@ impl Printer<'_, '_> {
                     I31 => self.print_type_keyword("i31")?,
                     Exn => self.print_type_keyword("exn")?,
                     NoExn => self.print_type_keyword("noexn")?,
+                    Cont => self.print_type_keyword("cont")?,
+                    NoCont => self.print_type_keyword("nocont")?,
                 }
                 if shared {
                     self.end_group()?;
@@ -1067,10 +1091,21 @@ impl Printer<'_, '_> {
             self.newline(offset)?;
             self.print_import(state, &import, true)?;
             match import.ty {
-                TypeRef::Func(_) => state.core.funcs += 1,
+                TypeRef::Func(idx) => {
+                    debug_assert!(state.core.func_to_type.len() == state.core.funcs as usize);
+                    state.core.funcs += 1;
+                    state.core.func_to_type.push(Some(idx))
+                }
                 TypeRef::Table(_) => state.core.tables += 1,
                 TypeRef::Memory(_) => state.core.memories += 1,
-                TypeRef::Tag(_) => state.core.tags += 1,
+                TypeRef::Tag(TagType {
+                    kind: _,
+                    func_type_idx: idx,
+                }) => {
+                    debug_assert!(state.core.tag_to_type.len() == state.core.tags as usize);
+                    state.core.tags += 1;
+                    state.core.tag_to_type.push(Some(idx))
+                }
                 TypeRef::Global(_) => state.core.globals += 1,
             }
         }
@@ -1205,7 +1240,7 @@ impl Printer<'_, '_> {
                 TableInit::RefNull => {}
                 TableInit::Expr(expr) => {
                     self.result.write_str(" ")?;
-                    self.print_const_expr(state, expr)?;
+                    self.print_const_expr(state, expr, self.config.fold_instructions)?;
                 }
             }
             self.end_group()?;
@@ -1231,7 +1266,9 @@ impl Printer<'_, '_> {
             self.newline(offset)?;
             self.print_tag_type(state, &tag, true)?;
             self.end_group()?;
+            debug_assert!(state.core.tag_to_type.len() == state.core.tags as usize);
             state.core.tags += 1;
+            state.core.tag_to_type.push(Some(tag.func_type_idx));
         }
         Ok(())
     }
@@ -1242,7 +1279,7 @@ impl Printer<'_, '_> {
             self.newline(offset)?;
             self.print_global_type(state, &global.ty, true)?;
             self.result.write_str(" ")?;
-            self.print_const_expr(state, &global.init_expr)?;
+            self.print_const_expr(state, &global.init_expr, self.config.fold_instructions)?;
             self.end_group()?;
             state.core.globals += 1;
         }
@@ -1253,7 +1290,6 @@ impl Printer<'_, '_> {
         &mut self,
         state: &mut State,
         body: &FunctionBody<'_>,
-        ty: u32,
     ) -> Result<()> {
         let mut body = body.get_binary_reader();
         let offset = body.original_position();
@@ -1262,6 +1298,10 @@ impl Printer<'_, '_> {
         let func_idx = state.core.funcs;
         self.print_name(&state.core.func_names, func_idx)?;
         self.result.write_str(" ")?;
+        let ty = match state.core.func_to_type.get(func_idx as usize) {
+            Some(Some(x)) => *x,
+            _ => panic!("invalid function type"),
+        };
         let params = self
             .print_core_functype_idx(state, ty, Some(func_idx))?
             .unwrap_or(0);
@@ -1293,7 +1333,7 @@ impl Printer<'_, '_> {
         func_idx: u32,
         params: u32,
         body: &mut BinaryReader<'_>,
-        mut branch_hints: &[(usize, BranchHint)],
+        branch_hints: &[(usize, BranchHint)],
     ) -> Result<()> {
         let mut first = true;
         let mut local_idx = 0;
@@ -1324,28 +1364,18 @@ impl Printer<'_, '_> {
         locals.finish(self)?;
 
         let nesting_start = self.nesting;
+        let fold_instructions = self.config.fold_instructions;
+        let mut operator_state = OperatorState::new(self, OperatorSeparator::Newline);
 
-        let mut op_printer =
-            operator::PrintOperator::new(self, state, operator::OperatorSeparator::Newline);
-        while !body.is_end_then_eof() {
-            // Branch hints are stored in increasing order of their body offset
-            // so print them whenever their instruction comes up.
-            if let Some(((hint_offset, hint), rest)) = branch_hints.split_first() {
-                if hint.func_offset == (body.original_position() - func_start) as u32 {
-                    branch_hints = rest;
-                    op_printer.printer.newline(*hint_offset)?;
-                    let desc = if hint.taken { "\"\\01\"" } else { "\"\\00\"" };
-                    op_printer.printer.result.start_comment()?;
-                    write!(
-                        op_printer.printer.result,
-                        "(@metadata.code.branch_hint {desc})",
-                    )?;
-                    op_printer.printer.result.reset_color()?;
-                }
-            }
-
-            op_printer.op_offset = body.original_position();
-            body.visit_operator(&mut op_printer)??;
+        if fold_instructions {
+            let mut folded_printer = PrintOperatorFolded::new(self, state, &mut operator_state);
+            folded_printer.set_offset(func_start);
+            folded_printer.begin_function(func_idx)?;
+            Self::print_operators(body, branch_hints, func_start, &mut folded_printer)?;
+            folded_printer.finalize()?;
+        } else {
+            let mut flat_printer = PrintOperator::new(self, state, &mut operator_state);
+            Self::print_operators(body, branch_hints, func_start, &mut flat_printer)?;
         }
 
         // If this was an invalid function body then the nesting may not
@@ -1358,6 +1388,28 @@ impl Printer<'_, '_> {
             self.newline(body.original_position())?;
         }
 
+        Ok(())
+    }
+
+    fn print_operators<'a, O: OpPrinter>(
+        body: &mut BinaryReader<'a>,
+        mut branch_hints: &[(usize, BranchHint)],
+        func_start: usize,
+        op_printer: &mut O,
+    ) -> Result<()> {
+        while !body.is_end_then_eof() {
+            // Branch hints are stored in increasing order of their body offset
+            // so print them whenever their instruction comes up.
+            if let Some(((hint_offset, hint), rest)) = branch_hints.split_first() {
+                if hint.func_offset == (body.original_position() - func_start) as u32 {
+                    branch_hints = rest;
+                    op_printer.branch_hint(*hint_offset, hint.taken)?;
+                }
+            }
+
+            op_printer.set_offset(body.original_position());
+            op_printer.visit_operator(body)?;
+        }
         Ok(())
     }
 
@@ -1385,7 +1437,7 @@ impl Printer<'_, '_> {
         // reasonable to avoid generating hundreds of megabytes of whitespace
         // for small-ish modules that have deep-ish nesting.
         for _ in 0..self.nesting.min(MAX_NESTING_TO_PRINT) {
-            self.result.write_str("  ")?;
+            self.result.write_str(&self.config.indent_text)?;
         }
         Ok(())
     }
@@ -1438,13 +1490,6 @@ impl Printer<'_, '_> {
     fn print_core_type_ref(&mut self, state: &State, idx: u32) -> Result<()> {
         self.start_group("type ")?;
         self.print_idx(&state.core.type_names, idx)?;
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_component_type_ref(&mut self, state: &State, idx: u32) -> Result<()> {
-        self.start_group("type ")?;
-        self.print_idx(&state.component.type_names, idx)?;
         self.end_group()?;
         Ok(())
     }
@@ -1615,1055 +1660,30 @@ impl Printer<'_, '_> {
 
         if reader.read().is_ok() && !reader.is_end_then_eof() {
             write!(self.result, "{explicit} ")?;
+            self.print_const_expr(state, expr, self.config.fold_instructions)?;
+        } else {
+            self.print_const_expr(state, expr, false)?;
         }
-
-        self.print_const_expr(state, expr)?;
 
         self.end_group()?;
         Ok(())
     }
 
     /// Prints the operators of `expr` space-separated.
-    fn print_const_expr(&mut self, state: &mut State, expr: &ConstExpr) -> Result<()> {
-        let mut reader = expr.get_operators_reader();
-        let mut first = true;
+    fn print_const_expr(&mut self, state: &mut State, expr: &ConstExpr, fold: bool) -> Result<()> {
+        let mut reader = expr.get_binary_reader();
+        let mut operator_state = OperatorState::new(self, OperatorSeparator::NoneThenSpace);
 
-        let mut op_printer =
-            operator::PrintOperator::new(self, state, operator::OperatorSeparator::None);
-        while !reader.is_end_then_eof() {
-            if first {
-                first = false;
-            } else {
-                write!(op_printer.printer.result, " ")?;
-            }
-            reader.visit_operator(&mut op_printer)??;
-        }
-        Ok(())
-    }
-
-    fn print_primitive_val_type(&mut self, ty: &PrimitiveValType) -> Result<()> {
-        match ty {
-            PrimitiveValType::Bool => self.print_type_keyword("bool")?,
-            PrimitiveValType::S8 => self.print_type_keyword("s8")?,
-            PrimitiveValType::U8 => self.print_type_keyword("u8")?,
-            PrimitiveValType::S16 => self.print_type_keyword("s16")?,
-            PrimitiveValType::U16 => self.print_type_keyword("u16")?,
-            PrimitiveValType::S32 => self.print_type_keyword("s32")?,
-            PrimitiveValType::U32 => self.print_type_keyword("u32")?,
-            PrimitiveValType::S64 => self.print_type_keyword("s64")?,
-            PrimitiveValType::U64 => self.print_type_keyword("u64")?,
-            PrimitiveValType::F32 => self.print_type_keyword("f32")?,
-            PrimitiveValType::F64 => self.print_type_keyword("f64")?,
-            PrimitiveValType::Char => self.print_type_keyword("char")?,
-            PrimitiveValType::String => self.print_type_keyword("string")?,
-        }
-        Ok(())
-    }
-
-    fn print_record_type(
-        &mut self,
-        state: &State,
-        fields: &[(&str, ComponentValType)],
-    ) -> Result<()> {
-        self.start_group("record")?;
-        for (name, ty) in fields.iter() {
-            self.result.write_str(" ")?;
-            self.start_group("field ")?;
-            self.print_str(name)?;
-            self.result.write_str(" ")?;
-            self.print_component_val_type(state, ty)?;
-            self.end_group()?;
-        }
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_variant_type(&mut self, state: &State, cases: &[VariantCase]) -> Result<()> {
-        self.start_group("variant")?;
-        for case in cases {
-            self.result.write_str(" ")?;
-            self.start_group("case ")?;
-            self.print_str(case.name)?;
-
-            if let Some(ty) = case.ty {
-                self.result.write_str(" ")?;
-                self.print_component_val_type(state, &ty)?;
-            }
-
-            if let Some(refines) = case.refines {
-                self.result.write_str(" ")?;
-                self.start_group("refines ")?;
-                write!(&mut self.result, "{}", refines)?;
-                self.end_group()?;
-            }
-            self.end_group()?;
-        }
-        self.end_group()?;
-
-        Ok(())
-    }
-
-    fn print_list_type(&mut self, state: &State, element_ty: &ComponentValType) -> Result<()> {
-        self.start_group("list ")?;
-        self.print_component_val_type(state, element_ty)?;
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_tuple_type(&mut self, state: &State, tys: &[ComponentValType]) -> Result<()> {
-        self.start_group("tuple")?;
-        for ty in tys {
-            self.result.write_str(" ")?;
-            self.print_component_val_type(state, ty)?;
-        }
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_flag_or_enum_type(&mut self, ty: &str, names: &[&str]) -> Result<()> {
-        self.start_group(ty)?;
-        for name in names {
-            self.result.write_str(" ")?;
-            self.print_str(name)?;
-        }
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_option_type(&mut self, state: &State, inner: &ComponentValType) -> Result<()> {
-        self.start_group("option ")?;
-        self.print_component_val_type(state, inner)?;
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_result_type(
-        &mut self,
-        state: &State,
-        ok: Option<ComponentValType>,
-        err: Option<ComponentValType>,
-    ) -> Result<()> {
-        self.start_group("result")?;
-
-        if let Some(ok) = ok {
-            self.result.write_str(" ")?;
-            self.print_component_val_type(state, &ok)?;
-        }
-
-        if let Some(err) = err {
-            self.result.write_str(" ")?;
-            self.start_group("error ")?;
-            self.print_component_val_type(state, &err)?;
-            self.end_group()?;
-        }
-
-        self.end_group()?;
-
-        Ok(())
-    }
-
-    fn print_defined_type(&mut self, state: &State, ty: &ComponentDefinedType) -> Result<()> {
-        match ty {
-            ComponentDefinedType::Primitive(ty) => self.print_primitive_val_type(ty)?,
-            ComponentDefinedType::Record(fields) => self.print_record_type(state, fields)?,
-            ComponentDefinedType::Variant(cases) => self.print_variant_type(state, cases)?,
-            ComponentDefinedType::List(ty) => self.print_list_type(state, ty)?,
-            ComponentDefinedType::Tuple(tys) => self.print_tuple_type(state, tys)?,
-            ComponentDefinedType::Flags(names) => self.print_flag_or_enum_type("flags", names)?,
-            ComponentDefinedType::Enum(cases) => self.print_flag_or_enum_type("enum", cases)?,
-            ComponentDefinedType::Option(ty) => self.print_option_type(state, ty)?,
-            ComponentDefinedType::Result { ok, err } => self.print_result_type(state, *ok, *err)?,
-            ComponentDefinedType::Own(idx) => {
-                self.start_group("own ")?;
-                self.print_idx(&state.component.type_names, *idx)?;
-                self.end_group()?;
-            }
-            ComponentDefinedType::Borrow(idx) => {
-                self.start_group("borrow ")?;
-                self.print_idx(&state.component.type_names, *idx)?;
-                self.end_group()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn print_component_val_type(&mut self, state: &State, ty: &ComponentValType) -> Result<()> {
-        match ty {
-            ComponentValType::Primitive(ty) => self.print_primitive_val_type(ty),
-            ComponentValType::Type(idx) => self.print_idx(&state.component.type_names, *idx),
-        }
-    }
-
-    fn print_module_type(
-        &mut self,
-        states: &mut Vec<State>,
-        decls: Vec<ModuleTypeDeclaration>,
-    ) -> Result<()> {
-        states.push(State::new(Encoding::Module));
-        self.newline_unknown_pos()?;
-        self.start_group("module")?;
-        for decl in decls {
-            self.newline_unknown_pos()?;
-            match decl {
-                ModuleTypeDeclaration::Type(rec) => {
-                    self.print_rec(states.last_mut().unwrap(), None, rec, false)?
-                }
-                ModuleTypeDeclaration::OuterAlias { kind, count, index } => {
-                    self.print_outer_alias(states, kind, count, index)?;
-                }
-                ModuleTypeDeclaration::Export { name, ty } => {
-                    self.start_group("export ")?;
-                    self.print_str(name)?;
-                    self.result.write_str(" ")?;
-                    self.print_import_ty(states.last_mut().unwrap(), &ty, false)?;
-                    self.end_group()?;
-                }
-                ModuleTypeDeclaration::Import(import) => {
-                    self.print_import(states.last_mut().unwrap(), &import, false)?;
-                }
-            }
-        }
-        self.end_group()?;
-        states.pop();
-        Ok(())
-    }
-
-    fn print_component_type<'a>(
-        &mut self,
-        states: &mut Vec<State>,
-        decls: Vec<ComponentTypeDeclaration<'a>>,
-    ) -> Result<()> {
-        states.push(State::new(Encoding::Component));
-        self.newline_unknown_pos()?;
-        self.start_group("component")?;
-        for decl in decls {
-            self.newline_unknown_pos()?;
-            match decl {
-                ComponentTypeDeclaration::CoreType(ty) => self.print_core_type(states, ty)?,
-                ComponentTypeDeclaration::Type(ty) => self.print_component_type_def(states, ty)?,
-                ComponentTypeDeclaration::Alias(alias) => {
-                    self.print_component_alias(states, alias)?;
-                }
-                ComponentTypeDeclaration::Export { name, ty } => {
-                    self.start_group("export ")?;
-                    self.print_component_kind_name(states.last_mut().unwrap(), ty.kind())?;
-                    self.result.write_str(" ")?;
-                    self.print_str(name.0)?;
-                    self.result.write_str(" ")?;
-                    self.print_component_import_ty(states.last_mut().unwrap(), &ty, false)?;
-                    self.end_group()?;
-                }
-                ComponentTypeDeclaration::Import(import) => {
-                    self.print_component_import(states.last_mut().unwrap(), &import, true)?
-                }
-            }
-        }
-        self.end_group()?;
-        states.pop().unwrap();
-        Ok(())
-    }
-
-    fn print_instance_type<'a>(
-        &mut self,
-        states: &mut Vec<State>,
-        decls: Vec<InstanceTypeDeclaration<'a>>,
-    ) -> Result<()> {
-        states.push(State::new(Encoding::Component));
-        self.newline_unknown_pos()?;
-        self.start_group("instance")?;
-        for decl in decls {
-            self.newline_unknown_pos()?;
-            match decl {
-                InstanceTypeDeclaration::CoreType(ty) => self.print_core_type(states, ty)?,
-                InstanceTypeDeclaration::Type(ty) => self.print_component_type_def(states, ty)?,
-                InstanceTypeDeclaration::Alias(alias) => {
-                    self.print_component_alias(states, alias)?;
-                }
-                InstanceTypeDeclaration::Export { name, ty } => {
-                    self.start_group("export ")?;
-                    self.print_component_kind_name(states.last_mut().unwrap(), ty.kind())?;
-                    self.result.write_str(" ")?;
-                    self.print_str(name.0)?;
-                    self.result.write_str(" ")?;
-                    self.print_component_import_ty(states.last_mut().unwrap(), &ty, false)?;
-                    self.end_group()?;
-                }
-            }
-        }
-        self.end_group()?;
-        states.pop().unwrap();
-        Ok(())
-    }
-
-    fn outer_state(states: &[State], count: u32) -> Result<&State> {
-        let count = count as usize;
-        if count >= states.len() {
-            bail!("invalid outer alias count of {}", count);
-        }
-
-        Ok(&states[states.len() - count - 1])
-    }
-
-    fn print_outer_alias(
-        &mut self,
-        states: &mut [State],
-        kind: OuterAliasKind,
-        count: u32,
-        index: u32,
-    ) -> Result<()> {
-        let state = states.last().unwrap();
-        let outer = Self::outer_state(states, count)?;
-        self.start_group("alias outer ")?;
-        if let Some(name) = outer.name.as_ref() {
-            name.write(self)?;
+        if fold {
+            let mut folded_printer = PrintOperatorFolded::new(self, state, &mut operator_state);
+            folded_printer.begin_const_expr();
+            Self::print_operators(&mut reader, &[], 0, &mut folded_printer)?;
+            folded_printer.finalize()?;
         } else {
-            write!(self.result, "{count}")?;
-        }
-        self.result.write_str(" ")?;
-        match kind {
-            OuterAliasKind::Type => {
-                self.print_idx(&outer.core.type_names, index)?;
-                self.result.write_str(" ")?;
-                self.start_group("type ")?;
-                self.print_name(&state.core.type_names, state.core.types.len() as u32)?;
-            }
-        }
-        self.end_group()?; // kind
-        self.end_group()?; // alias
-
-        let state = states.last_mut().unwrap();
-        match kind {
-            OuterAliasKind::Type => state.core.types.push(None),
+            let mut op_printer = PrintOperator::new(self, state, &mut operator_state);
+            Self::print_operators(&mut reader, &[], 0, &mut op_printer)?;
         }
 
-        Ok(())
-    }
-
-    fn print_component_func_type(&mut self, state: &State, ty: &ComponentFuncType) -> Result<()> {
-        self.start_group("func")?;
-        for (name, ty) in ty.params.iter() {
-            self.result.write_str(" ")?;
-            self.start_group("param ")?;
-            self.print_str(name)?;
-            self.result.write_str(" ")?;
-            self.print_component_val_type(state, ty)?;
-            self.end_group()?;
-        }
-
-        for (name, ty) in ty.results.iter() {
-            self.result.write_str(" ")?;
-            self.start_group("result ")?;
-            if let Some(name) = name {
-                self.print_str(name)?;
-                self.result.write_str(" ")?;
-            }
-            self.print_component_val_type(state, ty)?;
-            self.end_group()?;
-        }
-
-        self.end_group()?;
-
-        Ok(())
-    }
-
-    fn print_component_type_def<'a>(
-        &mut self,
-        states: &mut Vec<State>,
-        ty: ComponentType<'a>,
-    ) -> Result<()> {
-        self.start_group("type ")?;
-        {
-            let state = states.last_mut().unwrap();
-            self.print_name(&state.component.type_names, state.component.types)?;
-        }
-        match ty {
-            ComponentType::Defined(ty) => {
-                self.result.write_str(" ")?;
-                self.print_defined_type(states.last_mut().unwrap(), &ty)?;
-            }
-            ComponentType::Func(ty) => {
-                self.result.write_str(" ")?;
-                self.print_component_func_type(states.last_mut().unwrap(), &ty)?;
-            }
-            ComponentType::Component(decls) => {
-                self.print_component_type(states, decls.into_vec())?;
-            }
-            ComponentType::Instance(decls) => {
-                self.print_instance_type(states, decls.into_vec())?;
-            }
-            ComponentType::Resource { rep, dtor } => {
-                self.result.write_str(" ")?;
-                self.start_group("resource ")?;
-                self.start_group("rep ")?;
-                self.print_valtype(states.last().unwrap(), rep)?;
-                self.end_group()?;
-                if let Some(dtor) = dtor {
-                    self.result.write_str(" ")?;
-                    self.start_group("dtor ")?;
-                    self.start_group("func ")?;
-                    self.print_idx(&states.last().unwrap().core.func_names, dtor)?;
-                    self.end_group()?;
-                    self.end_group()?;
-                }
-                self.end_group()?;
-            }
-        }
-        self.end_group()?;
-
-        states.last_mut().unwrap().component.types += 1;
-
-        Ok(())
-    }
-
-    fn print_component_types<'a>(
-        &mut self,
-        states: &mut Vec<State>,
-        parser: ComponentTypeSectionReader<'a>,
-    ) -> Result<()> {
-        for ty in parser.into_iter_with_offsets() {
-            let (offset, ty) = ty?;
-            self.newline(offset)?;
-            self.print_component_type_def(states, ty)?;
-        }
-
-        Ok(())
-    }
-
-    fn print_component_imports(
-        &mut self,
-        state: &mut State,
-        parser: ComponentImportSectionReader,
-    ) -> Result<()> {
-        for import in parser.into_iter_with_offsets() {
-            let (offset, import) = import?;
-            self.newline(offset)?;
-            self.print_component_import(state, &import, true)?;
-        }
-
-        Ok(())
-    }
-
-    fn print_component_import(
-        &mut self,
-        state: &mut State,
-        import: &ComponentImport,
-        index: bool,
-    ) -> Result<()> {
-        self.start_group("import ")?;
-        self.print_str(import.name.0)?;
-        self.result.write_str(" ")?;
-        self.print_component_import_ty(state, &import.ty, index)?;
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_component_import_ty(
-        &mut self,
-        state: &mut State,
-        ty: &ComponentTypeRef,
-        index: bool,
-    ) -> Result<()> {
-        match ty {
-            ComponentTypeRef::Module(idx) => {
-                self.start_group("core module ")?;
-                if index {
-                    self.print_name(&state.core.module_names, state.core.modules as u32)?;
-                    self.result.write_str(" ")?;
-                    state.core.modules += 1;
-                }
-                self.print_core_type_ref(state, *idx)?;
-                self.end_group()?;
-            }
-            ComponentTypeRef::Func(idx) => {
-                self.start_group("func ")?;
-                if index {
-                    self.print_name(&state.component.func_names, state.component.funcs)?;
-                    self.result.write_str(" ")?;
-                    state.component.funcs += 1;
-                }
-                self.print_component_type_ref(state, *idx)?;
-                self.end_group()?;
-            }
-            ComponentTypeRef::Value(ty) => {
-                self.start_group("value ")?;
-                if index {
-                    self.print_name(&state.component.value_names, state.component.values)?;
-                    self.result.write_str(" ")?;
-                    state.component.values += 1;
-                }
-                match ty {
-                    ComponentValType::Primitive(ty) => self.print_primitive_val_type(ty)?,
-                    ComponentValType::Type(idx) => self.print_component_type_ref(state, *idx)?,
-                }
-                self.end_group()?;
-            }
-            ComponentTypeRef::Type(bounds) => {
-                self.start_group("type ")?;
-                if index {
-                    self.print_name(&state.component.type_names, state.component.types)?;
-                    self.result.write_str(" ")?;
-                    state.component.types += 1;
-                }
-                match bounds {
-                    TypeBounds::Eq(idx) => {
-                        self.start_group("eq ")?;
-                        self.print_idx(&state.component.type_names, *idx)?;
-                        self.end_group()?;
-                    }
-                    TypeBounds::SubResource => {
-                        self.start_group("sub ")?;
-                        self.print_type_keyword("resource")?;
-                        self.end_group()?;
-                    }
-                };
-                self.end_group()?;
-            }
-            ComponentTypeRef::Instance(idx) => {
-                self.start_group("instance ")?;
-                if index {
-                    self.print_name(&state.component.instance_names, state.component.instances)?;
-                    self.result.write_str(" ")?;
-                    state.component.instances += 1;
-                }
-                self.print_component_type_ref(state, *idx)?;
-                self.end_group()?;
-            }
-            ComponentTypeRef::Component(idx) => {
-                self.start_group("component ")?;
-                if index {
-                    self.print_name(&state.component.component_names, state.component.components)?;
-                    self.result.write_str(" ")?;
-                    state.component.components += 1;
-                }
-                self.print_component_type_ref(state, *idx)?;
-                self.end_group()?;
-            }
-        }
-        Ok(())
-    }
-
-    fn print_component_exports(
-        &mut self,
-        state: &mut State,
-        parser: ComponentExportSectionReader,
-    ) -> Result<()> {
-        for export in parser.into_iter_with_offsets() {
-            let (offset, export) = export?;
-            self.newline(offset)?;
-            self.print_component_export(state, &export, true)?;
-        }
-        Ok(())
-    }
-
-    fn print_component_export(
-        &mut self,
-        state: &mut State,
-        export: &ComponentExport,
-        named: bool,
-    ) -> Result<()> {
-        self.start_group("export ")?;
-        if named {
-            self.print_component_kind_name(state, export.kind)?;
-            self.result.write_str(" ")?;
-        }
-        self.print_str(export.name.0)?;
-        self.result.write_str(" ")?;
-        self.print_component_external_kind(state, export.kind, export.index)?;
-        if let Some(ty) = &export.ty {
-            self.result.write_str(" ")?;
-            self.print_component_import_ty(state, &ty, false)?;
-        }
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_component_kind_name(
-        &mut self,
-        state: &mut State,
-        kind: ComponentExternalKind,
-    ) -> Result<()> {
-        match kind {
-            ComponentExternalKind::Func => {
-                self.print_name(&state.component.func_names, state.component.funcs)?;
-                state.component.funcs += 1;
-            }
-            ComponentExternalKind::Module => {
-                self.print_name(&state.core.module_names, state.core.modules)?;
-                state.core.modules += 1;
-            }
-            ComponentExternalKind::Value => {
-                self.print_name(&state.component.value_names, state.component.values)?;
-                state.component.values += 1;
-            }
-            ComponentExternalKind::Type => {
-                self.print_name(&state.component.type_names, state.component.types)?;
-                state.component.types += 1;
-            }
-            ComponentExternalKind::Instance => {
-                self.print_name(&state.component.instance_names, state.component.instances)?;
-                state.component.instances += 1;
-            }
-            ComponentExternalKind::Component => {
-                self.print_name(&state.component.component_names, state.component.components)?;
-                state.component.components += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn start_component_external_kind_group(&mut self, kind: ComponentExternalKind) -> Result<()> {
-        match kind {
-            ComponentExternalKind::Module => {
-                self.start_group("core module ")?;
-            }
-            ComponentExternalKind::Component => {
-                self.start_group("component ")?;
-            }
-            ComponentExternalKind::Instance => {
-                self.start_group("instance ")?;
-            }
-            ComponentExternalKind::Func => {
-                self.start_group("func ")?;
-            }
-            ComponentExternalKind::Value => {
-                self.start_group("value ")?;
-            }
-            ComponentExternalKind::Type => {
-                self.start_group("type ")?;
-            }
-        }
-        Ok(())
-    }
-
-    fn print_component_external_kind(
-        &mut self,
-        state: &State,
-        kind: ComponentExternalKind,
-        index: u32,
-    ) -> Result<()> {
-        self.start_component_external_kind_group(kind)?;
-        match kind {
-            ComponentExternalKind::Module => {
-                self.print_idx(&state.core.module_names, index)?;
-            }
-            ComponentExternalKind::Component => {
-                self.print_idx(&state.component.component_names, index)?;
-            }
-            ComponentExternalKind::Instance => {
-                self.print_idx(&state.component.instance_names, index)?;
-            }
-            ComponentExternalKind::Func => {
-                self.print_idx(&state.component.func_names, index)?;
-            }
-            ComponentExternalKind::Value => {
-                self.print_idx(&state.component.value_names, index)?;
-            }
-            ComponentExternalKind::Type => {
-                self.print_idx(&state.component.type_names, index)?;
-            }
-        }
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_canonical_options(
-        &mut self,
-        state: &State,
-        options: &[CanonicalOption],
-    ) -> Result<()> {
-        for option in options {
-            self.result.write_str(" ")?;
-            match option {
-                CanonicalOption::UTF8 => self.result.write_str("string-encoding=utf8")?,
-                CanonicalOption::UTF16 => self.result.write_str("string-encoding=utf16")?,
-                CanonicalOption::CompactUTF16 => {
-                    self.result.write_str("string-encoding=latin1+utf16")?
-                }
-                CanonicalOption::Memory(idx) => {
-                    self.start_group("memory ")?;
-                    self.print_idx(&state.core.memory_names, *idx)?;
-                    self.end_group()?;
-                }
-                CanonicalOption::Realloc(idx) => {
-                    self.start_group("realloc ")?;
-                    self.print_idx(&state.core.func_names, *idx)?;
-                    self.end_group()?;
-                }
-                CanonicalOption::PostReturn(idx) => {
-                    self.start_group("post-return ")?;
-                    self.print_idx(&state.core.func_names, *idx)?;
-                    self.end_group()?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn print_canonical_functions(
-        &mut self,
-        state: &mut State,
-        parser: ComponentCanonicalSectionReader,
-    ) -> Result<()> {
-        for func in parser.into_iter_with_offsets() {
-            let (offset, func) = func?;
-            self.newline(offset)?;
-            match func {
-                CanonicalFunction::Lift {
-                    core_func_index,
-                    type_index,
-                    options,
-                } => {
-                    self.start_group("func ")?;
-                    self.print_name(&state.component.func_names, state.component.funcs)?;
-                    self.result.write_str(" ")?;
-                    self.start_group("type ")?;
-                    self.print_idx(&state.component.type_names, type_index)?;
-                    self.end_group()?;
-                    self.result.write_str(" ")?;
-                    self.start_group("canon lift ")?;
-                    self.start_group("core func ")?;
-                    self.print_idx(&state.core.func_names, core_func_index)?;
-                    self.end_group()?;
-                    self.print_canonical_options(state, &options)?;
-                    self.end_group()?;
-                    self.end_group()?;
-                    state.component.funcs += 1;
-                }
-                CanonicalFunction::Lower {
-                    func_index,
-                    options,
-                } => {
-                    self.start_group("core func ")?;
-                    self.print_name(&state.core.func_names, state.core.funcs)?;
-                    self.result.write_str(" ")?;
-                    self.start_group("canon lower ")?;
-                    self.start_group("func ")?;
-                    self.print_idx(&state.component.func_names, func_index)?;
-                    self.end_group()?;
-                    self.print_canonical_options(state, &options)?;
-                    self.end_group()?;
-                    self.end_group()?;
-                    state.core.funcs += 1;
-                }
-                CanonicalFunction::ResourceNew { resource } => {
-                    self.start_group("core func ")?;
-                    self.print_name(&state.core.func_names, state.core.funcs)?;
-                    self.result.write_str(" ")?;
-                    self.start_group("canon resource.new ")?;
-                    self.print_idx(&state.component.type_names, resource)?;
-                    self.end_group()?;
-                    self.end_group()?;
-                    state.core.funcs += 1;
-                }
-                CanonicalFunction::ResourceDrop { resource } => {
-                    self.start_group("core func ")?;
-                    self.print_name(&state.core.func_names, state.core.funcs)?;
-                    self.result.write_str(" ")?;
-                    self.start_group("canon resource.drop ")?;
-                    self.print_idx(&state.component.type_names, resource)?;
-                    self.end_group()?;
-                    self.end_group()?;
-                    state.core.funcs += 1;
-                }
-                CanonicalFunction::ResourceRep { resource } => {
-                    self.start_group("core func ")?;
-                    self.print_name(&state.core.func_names, state.core.funcs)?;
-                    self.result.write_str(" ")?;
-                    self.start_group("canon resource.rep ")?;
-                    self.print_idx(&state.component.type_names, resource)?;
-                    self.end_group()?;
-                    self.end_group()?;
-                    state.core.funcs += 1;
-                }
-                CanonicalFunction::ThreadSpawn {
-                    func_ty_index: func_index,
-                } => {
-                    self.start_group("core func ")?;
-                    self.print_name(&state.core.func_names, state.core.funcs)?;
-                    self.result.write_str(" ")?;
-                    self.start_group("canon thread.spawn ")?;
-                    self.print_idx(&state.core.type_names, func_index)?;
-                    self.end_group()?;
-                    self.end_group()?;
-                    state.core.funcs += 1;
-                }
-                CanonicalFunction::ThreadHwConcurrency => {
-                    self.start_group("core func ")?;
-                    self.print_name(&state.core.func_names, state.core.funcs)?;
-                    self.result.write_str(" ")?;
-                    self.start_group("canon thread.hw_concurrency")?;
-                    self.end_group()?;
-                    self.end_group()?;
-                    state.core.funcs += 1;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn print_instances(&mut self, state: &mut State, parser: InstanceSectionReader) -> Result<()> {
-        for instance in parser.into_iter_with_offsets() {
-            let (offset, instance) = instance?;
-            self.newline(offset)?;
-            self.start_group("core instance ")?;
-            self.print_name(&state.core.instance_names, state.core.instances)?;
-            match instance {
-                Instance::Instantiate { module_index, args } => {
-                    self.result.write_str(" ")?;
-                    self.start_group("instantiate ")?;
-                    self.print_idx(&state.core.module_names, module_index)?;
-                    for arg in args.iter() {
-                        self.newline(offset)?;
-                        self.print_instantiation_arg(state, arg)?;
-                    }
-                    self.end_group()?;
-                    state.core.instances += 1;
-                }
-                Instance::FromExports(exports) => {
-                    for export in exports.iter() {
-                        self.newline(offset)?;
-                        self.print_export(state, export)?;
-                    }
-                    state.core.instances += 1;
-                }
-            }
-            self.end_group()?;
-        }
-        Ok(())
-    }
-
-    fn print_component_instances(
-        &mut self,
-        state: &mut State,
-        parser: ComponentInstanceSectionReader,
-    ) -> Result<()> {
-        for instance in parser.into_iter_with_offsets() {
-            let (offset, instance) = instance?;
-            self.newline(offset)?;
-            self.start_group("instance ")?;
-            self.print_name(&state.component.instance_names, state.component.instances)?;
-            state.component.instances += 1;
-            match instance {
-                ComponentInstance::Instantiate {
-                    component_index,
-                    args,
-                } => {
-                    self.result.write_str(" ")?;
-                    self.start_group("instantiate ")?;
-                    self.print_idx(&state.component.component_names, component_index)?;
-                    for arg in args.iter() {
-                        self.newline(offset)?;
-                        self.print_component_instantiation_arg(state, arg)?;
-                    }
-                    self.end_group()?;
-                }
-                ComponentInstance::FromExports(exports) => {
-                    for export in exports.iter() {
-                        self.newline(offset)?;
-                        self.print_component_export(state, export, false)?;
-                    }
-                }
-            }
-            self.end_group()?;
-        }
-        Ok(())
-    }
-
-    fn print_instantiation_arg(&mut self, state: &State, arg: &InstantiationArg) -> Result<()> {
-        self.start_group("with ")?;
-        self.print_str(arg.name)?;
-        self.result.write_str(" ")?;
-        match arg.kind {
-            InstantiationArgKind::Instance => {
-                self.start_group("instance ")?;
-                self.print_idx(&state.core.instance_names, arg.index)?;
-                self.end_group()?;
-            }
-        }
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_component_instantiation_arg(
-        &mut self,
-        state: &State,
-        arg: &ComponentInstantiationArg,
-    ) -> Result<()> {
-        self.start_group("with ")?;
-        self.print_str(arg.name)?;
-        self.result.write_str(" ")?;
-        self.print_component_external_kind(state, arg.kind, arg.index)?;
-        self.end_group()?;
-        Ok(())
-    }
-
-    fn print_component_start(
-        &mut self,
-        state: &mut State,
-        pos: usize,
-        start: ComponentStartFunction,
-    ) -> Result<()> {
-        self.newline(pos)?;
-        self.start_group("start ")?;
-        self.print_idx(&state.component.func_names, start.func_index)?;
-
-        for arg in start.arguments.iter() {
-            self.result.write_str(" ")?;
-            self.start_group("value ")?;
-            self.print_idx(&state.component.value_names, *arg)?;
-            self.end_group()?;
-        }
-
-        for _ in 0..start.results {
-            self.result.write_str(" ")?;
-            self.start_group("result ")?;
-            self.start_group("value ")?;
-            self.print_name(&state.component.value_names, state.component.values)?;
-            self.end_group()?;
-            self.end_group()?;
-            state.component.values += 1;
-        }
-
-        self.end_group()?; // start
-
-        Ok(())
-    }
-
-    fn print_component_aliases(
-        &mut self,
-        states: &mut [State],
-        parser: ComponentAliasSectionReader,
-    ) -> Result<()> {
-        for alias in parser.into_iter_with_offsets() {
-            let (offset, alias) = alias?;
-            self.newline(offset)?;
-            self.print_component_alias(states, alias)?;
-        }
-        Ok(())
-    }
-
-    fn print_component_alias(
-        &mut self,
-        states: &mut [State],
-        alias: ComponentAlias<'_>,
-    ) -> Result<()> {
-        match alias {
-            ComponentAlias::InstanceExport {
-                kind,
-                instance_index,
-                name,
-            } => {
-                let state = states.last_mut().unwrap();
-                self.start_group("alias export ")?;
-                self.print_idx(&state.component.instance_names, instance_index)?;
-                self.result.write_str(" ")?;
-                self.print_str(name)?;
-                self.result.write_str(" ")?;
-                self.start_component_external_kind_group(kind)?;
-                self.print_component_kind_name(state, kind)?;
-                self.end_group()?;
-
-                self.end_group()?; // alias export
-            }
-            ComponentAlias::CoreInstanceExport {
-                instance_index,
-                kind,
-                name,
-            } => {
-                let state = states.last_mut().unwrap();
-                self.start_group("alias core export ")?;
-                self.print_idx(&state.core.instance_names, instance_index)?;
-                self.result.write_str(" ")?;
-                self.print_str(name)?;
-                self.result.write_str(" ")?;
-                match kind {
-                    ExternalKind::Func => {
-                        self.start_group("core func ")?;
-                        self.print_name(&state.core.func_names, state.core.funcs)?;
-                        self.end_group()?;
-                        state.core.funcs += 1;
-                    }
-                    ExternalKind::Table => {
-                        self.start_group("core table ")?;
-                        self.print_name(&state.core.table_names, state.core.tables)?;
-                        self.end_group()?;
-                        state.core.tables += 1;
-                    }
-                    ExternalKind::Memory => {
-                        self.start_group("core memory ")?;
-                        self.print_name(&state.core.memory_names, state.core.memories)?;
-                        self.end_group()?;
-                        state.core.memories += 1;
-                    }
-                    ExternalKind::Global => {
-                        self.start_group("core global ")?;
-                        self.print_name(&state.core.global_names, state.core.globals)?;
-                        self.end_group()?;
-                        state.core.globals += 1;
-                    }
-                    ExternalKind::Tag => {
-                        self.start_group("core tag ")?;
-                        self.print_name(&state.core.tag_names, state.core.tags)?;
-                        self.end_group()?;
-                        state.core.tags += 1;
-                    }
-                }
-                self.end_group()?; // alias export
-            }
-
-            ComponentAlias::Outer { kind, count, index } => {
-                let state = states.last().unwrap();
-                let outer = Self::outer_state(states, count)?;
-                self.start_group("alias outer ")?;
-                if let Some(name) = outer.name.as_ref() {
-                    name.write(self)?;
-                } else {
-                    write!(self.result, "{count}")?;
-                }
-                self.result.write_str(" ")?;
-                match kind {
-                    ComponentOuterAliasKind::CoreModule => {
-                        self.print_idx(&outer.core.module_names, index)?;
-                        self.result.write_str(" ")?;
-                        self.start_group("core module ")?;
-                        self.print_name(&state.core.module_names, state.core.modules)?;
-                    }
-                    ComponentOuterAliasKind::CoreType => {
-                        self.print_idx(&outer.core.type_names, index)?;
-                        self.result.write_str(" ")?;
-                        self.start_group("core type ")?;
-                        self.print_name(&state.core.type_names, state.core.types.len() as u32)?;
-                    }
-                    ComponentOuterAliasKind::Type => {
-                        self.print_idx(&outer.component.type_names, index)?;
-                        self.result.write_str(" ")?;
-                        self.start_group("type ")?;
-                        self.print_name(&state.component.type_names, state.component.types)?;
-                    }
-                    ComponentOuterAliasKind::Component => {
-                        self.print_idx(&outer.component.component_names, index)?;
-                        self.result.write_str(" ")?;
-                        self.start_group("component ")?;
-                        self.print_name(
-                            &state.component.component_names,
-                            state.component.components,
-                        )?;
-                    }
-                }
-                self.end_group()?; // kind
-                self.end_group()?; // alias
-
-                let state = states.last_mut().unwrap();
-                match kind {
-                    ComponentOuterAliasKind::CoreModule => state.core.modules += 1,
-                    ComponentOuterAliasKind::CoreType => state.core.types.push(None),
-                    ComponentOuterAliasKind::Type => state.component.types += 1,
-                    ComponentOuterAliasKind::Component => state.component.components += 1,
-                }
-            }
-        }
         Ok(())
     }
 
@@ -2728,19 +1748,13 @@ impl Printer<'_, '_> {
 
             // These are parsed during `read_names` and are part of
             // printing elsewhere, so don't print them.
-            KnownCustom::Name(_) | KnownCustom::ComponentName(_) | KnownCustom::BranchHints(_) => {
-                Ok(())
-            }
+            KnownCustom::Name(_) | KnownCustom::BranchHints(_) => Ok(()),
+            #[cfg(feature = "component-model")]
+            KnownCustom::ComponentName(_) => Ok(()),
 
             // Custom sections without a text format at this time and unknown
             // custom sections get a `@custom` annotation printed.
-            KnownCustom::CoreDump(_)
-            | KnownCustom::CoreDumpModules(_)
-            | KnownCustom::CoreDumpStack(_)
-            | KnownCustom::CoreDumpInstances(_)
-            | KnownCustom::Linking(_)
-            | KnownCustom::Reloc(_)
-            | KnownCustom::Unknown => self.print_raw_custom_section(state, section),
+            _ => self.print_raw_custom_section(state, section),
         }
     }
 
@@ -3217,20 +2231,24 @@ macro_rules! naming_namespaces {
 
 naming_namespaces! {
     struct NameFunc => "func"
-    struct NameModule => "module"
-    struct NameInstance => "instance"
     struct NameGlobal => "global"
     struct NameMemory => "memory"
     struct NameLocal => "local"
     struct NameLabel => "label"
     struct NameTable => "table"
-    struct NameValue => "value"
     struct NameType => "type"
     struct NameField => "field"
     struct NameData => "data"
     struct NameElem => "elem"
-    struct NameComponent => "component"
     struct NameTag => "tag"
+}
+
+#[cfg(feature = "component-model")]
+naming_namespaces! {
+    struct NameModule => "module"
+    struct NameInstance => "instance"
+    struct NameValue => "value"
+    struct NameComponent => "component"
 }
 
 fn name_map<K>(into: &mut NamingMap<u32, K>, names: NameMap<'_>, name: &str) -> Result<()> {

@@ -55,7 +55,8 @@ impl<'a> Expander<'a> {
                     InnerTypeKind::Func(f) => {
                         f.key().insert(self, Index::Id(id));
                     }
-                    InnerTypeKind::Array(_) | InnerTypeKind::Struct(_) => {}
+                    InnerTypeKind::Array(_) | InnerTypeKind::Struct(_) | InnerTypeKind::Cont(_) => {
+                    }
                 }
             }
             _ => {}
@@ -208,7 +209,7 @@ impl<'a> Expander<'a> {
         }
 
         // ... and failing that we insert a new type definition.
-        let id = gensym::gen(span);
+        let id = gensym::generate(span);
         self.to_prepend.push(ModuleField::Type(Type {
             span,
             id: Some(id),

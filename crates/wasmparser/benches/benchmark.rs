@@ -4,6 +4,7 @@ use once_cell::unsync::Lazy;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use wasmparser::VisitSimdOperator;
 use wasmparser::{DataKind, ElementKind, Parser, Payload, Validator, VisitOperator, WasmFeatures};
 
 /// A benchmark input.
@@ -218,6 +219,24 @@ fn read_all_wasm(wasm: &[u8]) -> Result<()> {
             | CustomSection { .. }
             | CodeSectionStart { .. }
             | End(_) => {}
+
+            other => {
+                // NB: if you hit this panic if you'd be so kind as to grep
+                // through other locations in the code base that need to be
+                // updated as well. As of the time of this writing the locations
+                // might be:
+                //
+                //  * src/bin/wasm-tools/objdump.rs
+                //  * src/bin/wasm-tools/dump.rs
+                //  * crates/wasm-encoder/src/reencode.rs
+                //  * crates/wasm-encoder/src/reencode/component.rs
+                //  * crates/wasmprinter/src/lib.rs
+                //  * crates/wit-component/src/gc.rs
+                //
+                // This is required due to the `#[non_exhaustive]` nature of
+                // the `Payload` enum.
+                panic!("a new match statement should be added above for this case: {other:?}")
+            }
         }
     }
     Ok(())
@@ -253,6 +272,9 @@ fn define_benchmarks(c: &mut Criterion) {
 
     fn validator() -> Validator {
         Validator::new_with_features(WasmFeatures::all())
+    }
+    fn old_validator() -> Validator {
+        Validator::new_with_features(WasmFeatures::WASM2)
     }
 
     let test_inputs = once_cell::unsync::Lazy::new(collect_benchmark_inputs);
@@ -311,6 +333,14 @@ fn define_benchmarks(c: &mut Criterion) {
                 validator().validate_all(&wasm).unwrap();
             })
         });
+        if old_validator().validate_all(&wasm).is_ok() {
+            c.bench_function(&format!("validate-old/{name}"), |b| {
+                Lazy::force(&wasm);
+                b.iter(|| {
+                    old_validator().validate_all(&wasm).unwrap();
+                })
+            });
+        }
         c.bench_function(&format!("parse/{name}"), |b| {
             Lazy::force(&wasm);
             b.iter(|| {
@@ -326,7 +356,7 @@ criterion_main!(benchmark);
 struct NopVisit;
 
 macro_rules! define_visit_operator {
-    ($(@$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident)*) => {
+    ($(@$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident ($($ann:tt)*))*) => {
         $(
             fn $visit(&mut self $($(,$arg: $argty)*)?) {
                 define_visit_operator!(@visit $op $( $($arg)* )?);
@@ -346,5 +376,14 @@ macro_rules! define_visit_operator {
 impl<'a> VisitOperator<'a> for NopVisit {
     type Output = ();
 
-    wasmparser::for_each_operator!(define_visit_operator);
+    fn simd_visitor(&mut self) -> Option<&mut dyn VisitSimdOperator<'a, Output = Self::Output>> {
+        Some(self)
+    }
+
+    wasmparser::for_each_visit_operator!(define_visit_operator);
+}
+
+#[allow(unused_variables)]
+impl<'a> VisitSimdOperator<'a> for NopVisit {
+    wasmparser::for_each_visit_simd_operator!(define_visit_operator);
 }

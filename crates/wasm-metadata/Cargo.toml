@@ -13,13 +13,11 @@ workspace = true
 [dependencies]
 clap = { workspace = true, optional = true }
 anyhow = { workspace = true }
-wasmparser = { workspace = true }
-wasm-encoder = { workspace = true }
+wasmparser = { workspace = true, features = ['std', 'component-model', 'hash-collections'] }
+wasm-encoder = { workspace = true, features = ['std', 'component-model'] }
 indexmap = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_derive = { workspace = true }
-serde_json = { version = "1" }
-spdx = "0.10.1"
-
-[dev-dependencies]
-wat = { workspace = true }
+serde_json = { workspace = true }
+spdx = { workspace = true }
+url = { workspace = true }

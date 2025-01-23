@@ -1,5 +1,7 @@
 use crate::{encode_section, Encode, HeapType, RefType, Section, SectionId, ValType};
-use std::borrow::Cow;
+use alloc::borrow::Cow;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// An encoder for the code section.
 ///
@@ -1203,6 +1205,32 @@ pub enum Instruction<'a> {
         array_type_index: u32,
     },
     RefI31Shared,
+    // Stack switching
+    ContNew(u32),
+    ContBind {
+        argument_index: u32,
+        result_index: u32,
+    },
+    Suspend(u32),
+    Resume {
+        cont_type_index: u32,
+        resume_table: Cow<'a, [Handle]>,
+    },
+    ResumeThrow {
+        cont_type_index: u32,
+        tag_index: u32,
+        resume_table: Cow<'a, [Handle]>,
+    },
+    Switch {
+        cont_type_index: u32,
+        tag_index: u32,
+    },
+
+    // Wide Arithmetic
+    I64Add128,
+    I64Sub128,
+    I64MulWideS,
+    I64MulWideU,
 }
 
 impl Encode for Instruction<'_> {
@@ -3695,6 +3723,64 @@ impl Encode for Instruction<'_> {
                 sink.push(0xFE);
                 sink.push(0x72);
             }
+            Instruction::ContNew(type_index) => {
+                sink.push(0xE0);
+                type_index.encode(sink);
+            }
+            Instruction::ContBind {
+                argument_index,
+                result_index,
+            } => {
+                sink.push(0xE1);
+                argument_index.encode(sink);
+                result_index.encode(sink);
+            }
+            Instruction::Suspend(tag_index) => {
+                sink.push(0xE2);
+                tag_index.encode(sink);
+            }
+            Instruction::Resume {
+                cont_type_index,
+                ref resume_table,
+            } => {
+                sink.push(0xE3);
+                cont_type_index.encode(sink);
+                resume_table.encode(sink);
+            }
+            Instruction::ResumeThrow {
+                cont_type_index,
+                tag_index,
+                ref resume_table,
+            } => {
+                sink.push(0xE4);
+                cont_type_index.encode(sink);
+                tag_index.encode(sink);
+                resume_table.encode(sink);
+            }
+            Instruction::Switch {
+                cont_type_index,
+                tag_index,
+            } => {
+                sink.push(0xE5);
+                cont_type_index.encode(sink);
+                tag_index.encode(sink);
+            }
+            Instruction::I64Add128 => {
+                sink.push(0xFC);
+                19u32.encode(sink);
+            }
+            Instruction::I64Sub128 => {
+                sink.push(0xFC);
+                20u32.encode(sink);
+            }
+            Instruction::I64MulWideS => {
+                sink.push(0xFC);
+                21u32.encode(sink);
+            }
+            Instruction::I64MulWideU => {
+                sink.push(0xFC);
+                22u32.encode(sink);
+            }
         }
     }
 }
@@ -3733,6 +3819,29 @@ impl Encode for Catch {
     }
 }
 
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub enum Handle {
+    OnLabel { tag: u32, label: u32 },
+    OnSwitch { tag: u32 },
+}
+
+impl Encode for Handle {
+    fn encode(&self, sink: &mut Vec<u8>) {
+        match self {
+            Handle::OnLabel { tag, label } => {
+                sink.push(0x00);
+                tag.encode(sink);
+                label.encode(sink);
+            }
+            Handle::OnSwitch { tag } => {
+                sink.push(0x01);
+                tag.encode(sink);
+            }
+        }
+    }
+}
+
 /// A constant expression.
 ///
 /// Usable in contexts such as offsets or initializers.
@@ -3752,6 +3861,15 @@ impl ConstExpr {
         Self {
             bytes: bytes.into_iter().collect(),
         }
+    }
+
+    /// Create a constant expression with the sequence of instructions
+    pub fn extended<'a>(insns: impl IntoIterator<Item = Instruction<'a>>) -> Self {
+        let mut bytes = vec![];
+        for insn in insns {
+            insn.encode(&mut bytes);
+        }
+        Self { bytes }
     }
 
     fn new_insn(insn: Instruction) -> Self {
@@ -3883,10 +4001,7 @@ impl ConstExpr {
         if prefix != 0xd2 {
             return None;
         }
-        leb128::read::unsigned(&mut &self.bytes[1..])
-            .ok()?
-            .try_into()
-            .ok()
+        leb128fmt::decode_uint_slice::<u32, 32>(&self.bytes[1..], &mut 0).ok()
     }
 }
 

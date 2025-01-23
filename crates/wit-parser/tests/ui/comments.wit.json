@@ -9,7 +9,7 @@
       },
       "functions": {},
       "docs": {
-        "contents": "hello\nworld\nwhy, yes\nthis is a comment\n* this too */\n* is a comment */\n* this /* is /* a */ nested */ comment */"
+        "contents": " hello\n world\n why, yes\n this is a comment\n* this too */\n* is a comment */\n* this /* is /* a */ nested */ comment */"
       },
       "package": 0
     }
@@ -27,10 +27,7 @@
     {
       "name": "bar",
       "kind": {
-        "stream": {
-          "element": 0,
-          "end": null
-        }
+        "stream": 0
       },
       "owner": {
         "interface": 0

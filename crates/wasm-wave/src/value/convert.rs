@@ -78,8 +78,8 @@ impl_primitives!(
     (U16, u16),
     (U32, u32),
     (U64, u64),
-    (Float32, f32),
-    (Float64, f64),
+    (F32, f32),
+    (F64, f64),
     (Char, char)
 );
 
@@ -95,7 +95,7 @@ impl From<String> for Value {
     }
 }
 
-impl<'a> ValueTyped for &'a str {
+impl ValueTyped for &str {
     fn value_type() -> Type {
         String::value_type()
     }
@@ -217,7 +217,7 @@ mod tests {
         for ty in [
             Type::BOOL,
             Type::U8,
-            Type::FLOAT32,
+            Type::F32,
             Type::STRING,
             Type::list(Type::BOOL),
             Type::record([("a", Type::BOOL)]).unwrap(),

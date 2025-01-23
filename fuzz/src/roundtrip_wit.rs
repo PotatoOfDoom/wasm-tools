@@ -1,7 +1,7 @@
 use arbitrary::{Result, Unstructured};
 use std::path::Path;
 use wit_component::*;
-use wit_parser::{PackageId, Resolve};
+use wit_parser::{LiftLowerAbi, ManglingAndAbi, PackageId, Resolve};
 
 pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
     let wasm = u.arbitrary().and_then(|config| {
@@ -36,7 +36,14 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
     let mut decoded_bindgens = Vec::new();
     for (id, world) in resolve.worlds.iter().take(20) {
         log::debug!("embedding world {} as in a dummy module", world.name);
-        let mut dummy = wit_component::dummy_module(&resolve, id);
+        let mangling = match u.int_in_range(0..=3)? {
+            0 => ManglingAndAbi::Legacy(LiftLowerAbi::Sync),
+            1 => ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),
+            2 => ManglingAndAbi::Legacy(LiftLowerAbi::AsyncStackful),
+            3 => ManglingAndAbi::Standard32,
+            _ => unreachable!(),
+        };
+        let mut dummy = wit_component::dummy_module(&resolve, id, mangling);
         wit_component::embed_component_metadata(&mut dummy, &resolve, id, StringEncoding::UTF8)
             .unwrap();
         write_file("dummy.wasm", &dummy);
@@ -48,7 +55,9 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
             .encode()
             .unwrap();
         write_file("dummy.component.wasm", &wasm);
-        wasmparser::Validator::new().validate_all(&wasm).unwrap();
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&wasm)
+            .unwrap();
 
         // Decode what was just created and record it later for testing merging
         // worlds together.
@@ -71,20 +80,27 @@ pub fn run(u: &mut Unstructured<'_>) -> Result<()> {
 
     let i = u.choose_index(decoded_bindgens.len())?;
     let (mut b1, wasm1, world1) = decoded_bindgens.swap_remove(i);
-    let i = u.choose_index(decoded_bindgens.len())?;
-    let (b2, wasm2, world2) = decoded_bindgens.swap_remove(i);
 
-    log::debug!("merging bindgens world {world1} <- world {world2}");
+    if u.arbitrary()? {
+        let i = u.choose_index(decoded_bindgens.len())?;
+        let (b2, wasm2, world2) = decoded_bindgens.swap_remove(i);
 
-    write_file("bindgen1.wasm", &wasm1);
-    write_file("bindgen2.wasm", &wasm2);
+        log::debug!("merging bindgens world {world1} <- world {world2}");
 
-    // Merging worlds may fail but if successful then a `Resolve` is asserted
-    // to be valid which is what we're interested in here. Note that failure
-    // here can be due to the structure of worlds which aren't reasonable to
-    // control in this generator, so it's just done to see what happens and try
-    // to trigger panics in `Resolve::assert_valid`.
-    let _ = b1.merge(b2);
+        write_file("bindgen1.wasm", &wasm1);
+        write_file("bindgen2.wasm", &wasm2);
+
+        // Merging worlds may fail but if successful then a `Resolve` is asserted
+        // to be valid which is what we're interested in here. Note that failure
+        // here can be due to the structure of worlds which aren't reasonable to
+        // control in this generator, so it's just done to see what happens and try
+        // to trigger panics in `Resolve::assert_valid`.
+        let _ = b1.merge(b2);
+    } else {
+        log::debug!("merging world imports based on semver {world1}");
+        write_file("bindgen1.wasm", &wasm1);
+        let _ = b1.resolve.merge_world_imports_based_on_semver(b1.world);
+    }
     Ok(())
 }
 
@@ -98,9 +114,9 @@ fn roundtrip_through_printing(file: &str, resolve: &Resolve, pkg: PackageId, was
         .map(|p| p.0)
         .filter(|k| *k != pkg)
         .collect::<Vec<_>>();
-    let doc = WitPrinter::default()
-        .print(resolve, pkg, &package_deps)
-        .unwrap();
+    let mut printer = WitPrinter::default();
+    printer.print(resolve, pkg, &package_deps).unwrap();
+    let doc = printer.output.to_string();
     let new_pkg = new_resolve
         .push_str(&format!("printed-{file}.wit"), &doc)
         .unwrap();

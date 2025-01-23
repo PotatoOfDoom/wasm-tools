@@ -377,6 +377,10 @@ id! {
     pub mod core;
 
     // Support for component model parsing
+    #[cfg(feature = "component-model")]
+    pub mod component;
+    #[cfg(not(feature = "component-model"))]
+    #[path = "component_disabled.rs"]
     pub mod component;
 }
 
@@ -396,6 +400,7 @@ pub mod kw {
     custom_keyword!(assert_return);
     custom_keyword!(assert_trap);
     custom_keyword!(assert_unlinkable);
+    custom_keyword!(assert_suspension);
     custom_keyword!(before);
     custom_keyword!(binary);
     custom_keyword!(block);
@@ -405,6 +410,8 @@ pub mod kw {
     custom_keyword!(catch_all);
     custom_keyword!(catch_all_ref);
     custom_keyword!(code);
+    custom_keyword!(cont);
+    custom_keyword!(contref);
     custom_keyword!(component);
     custom_keyword!(data);
     custom_keyword!(declare);
@@ -454,16 +461,19 @@ pub mod kw {
     custom_keyword!(modulecode);
     custom_keyword!(nan_arithmetic = "nan:arithmetic");
     custom_keyword!(nan_canonical = "nan:canonical");
+    custom_keyword!(nocont);
     custom_keyword!(nofunc);
     custom_keyword!(noextern);
     custom_keyword!(noexn);
     custom_keyword!(none);
     custom_keyword!(null);
+    custom_keyword!(nullcontref);
     custom_keyword!(nullfuncref);
     custom_keyword!(nullexternref);
     custom_keyword!(nullexnref);
     custom_keyword!(nullref);
     custom_keyword!(offset);
+    custom_keyword!(on);
     custom_keyword!(outer);
     custom_keyword!(own);
     custom_keyword!(pagesize);
@@ -492,6 +502,7 @@ pub mod kw {
     custom_keyword!(shared);
     custom_keyword!(start);
     custom_keyword!(sub);
+    custom_keyword!(switch);
     custom_keyword!(r#final = "final");
     custom_keyword!(table);
     custom_keyword!(then);
@@ -545,8 +556,35 @@ pub mod kw {
     custom_keyword!(thread);
     custom_keyword!(thread_spawn = "thread.spawn");
     custom_keyword!(thread_hw_concurrency = "thread.hw_concurrency");
+    custom_keyword!(task_backpressure = "task.backpressure");
+    custom_keyword!(task_return = "task.return");
+    custom_keyword!(task_wait = "task.wait");
+    custom_keyword!(task_poll = "task.poll");
+    custom_keyword!(task_yield = "task.yield");
+    custom_keyword!(subtask_drop = "subtask.drop");
+    custom_keyword!(stream_new = "stream.new");
+    custom_keyword!(stream_read = "stream.read");
+    custom_keyword!(stream_write = "stream.write");
+    custom_keyword!(stream_cancel_read = "stream.cancel-read");
+    custom_keyword!(stream_cancel_write = "stream.cancel-write");
+    custom_keyword!(stream_close_readable = "stream.close-readable");
+    custom_keyword!(stream_close_writable = "stream.close-writable");
+    custom_keyword!(future_new = "future.new");
+    custom_keyword!(future_read = "future.read");
+    custom_keyword!(future_write = "future.write");
+    custom_keyword!(future_cancel_read = "future.cancel-read");
+    custom_keyword!(future_cancel_write = "future.cancel-write");
+    custom_keyword!(future_close_readable = "future.close-readable");
+    custom_keyword!(future_close_writable = "future.close-writable");
+    custom_keyword!(error_context_new = "error-context.new");
+    custom_keyword!(error_context_debug_message = "error-context.debug-message");
+    custom_keyword!(error_context_drop = "error-context.drop");
     custom_keyword!(wait);
     custom_keyword!(definition);
+    custom_keyword!(r#async = "async");
+    custom_keyword!(callback);
+    custom_keyword!(stream);
+    custom_keyword!(future);
 }
 
 /// Common annotations used to parse WebAssembly text files.

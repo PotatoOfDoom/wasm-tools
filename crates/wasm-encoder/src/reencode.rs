@@ -3,11 +3,18 @@
 //! The [`RoundtripReencoder`] allows encoding identical wasm to the parsed
 //! input.
 
-use crate::CoreTypeEncoder;
-use std::convert::Infallible;
+#[cfg(all(not(feature = "std"), core_error))]
+use core::error::Error as StdError;
+#[cfg(feature = "std")]
+use std::error::Error as StdError;
 
+use crate::CoreTypeEncoder;
+use core::convert::Infallible;
+
+#[cfg(feature = "component-model")]
 mod component;
 
+#[cfg(feature = "component-model")]
 pub use self::component::*;
 
 #[allow(missing_docs)] // FIXME
@@ -127,11 +134,22 @@ pub trait Reencode {
         utils::func_type(self, func_ty)
     }
 
+    fn cont_type(
+        &mut self,
+        cont_ty: wasmparser::ContType,
+    ) -> Result<crate::ContType, Error<Self::Error>> {
+        utils::cont_type(self, cont_ty)
+    }
+
     fn global_type(
         &mut self,
         global_ty: wasmparser::GlobalType,
     ) -> Result<crate::GlobalType, Error<Self::Error>> {
         utils::global_type(self, global_ty)
+    }
+
+    fn handle(&mut self, on: wasmparser::Handle) -> crate::Handle {
+        utils::handle(self, on)
     }
 
     fn heap_type(
@@ -533,8 +551,8 @@ impl<E> From<wasmparser::BinaryReaderError> for Error<E> {
     }
 }
 
-impl<E: std::fmt::Display> std::fmt::Display for Error<E> {
-    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
+impl<E: core::fmt::Display> core::fmt::Display for Error<E> {
+    fn fmt(&self, fmt: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             Self::ParseError(_e) => {
                 write!(fmt, "There was an error when parsing")
@@ -561,8 +579,9 @@ impl<E: std::fmt::Display> std::fmt::Display for Error<E> {
     }
 }
 
-impl<E: 'static + std::error::Error> std::error::Error for Error<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+#[cfg(any(feature = "std", core_error))]
+impl<E: 'static + StdError> StdError for Error<E> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
             Self::ParseError(e) => Some(e),
             Self::UserError(e) => Some(e),
@@ -589,6 +608,8 @@ impl Reencode for RoundtripReencoder {
 pub mod utils {
     use super::{Error, Reencode};
     use crate::{CoreTypeEncoder, Encode};
+    use alloc::vec::Vec;
+    use core::ops::Range;
 
     pub fn parse_core_module<T: ?Sized + Reencode>(
         reencoder: &mut T,
@@ -602,12 +623,22 @@ pub mod utils {
             last_section: &mut Option<crate::SectionId>,
             next_section: Option<crate::SectionId>,
         ) -> Result<(), Error<T::Error>> {
-            let after = std::mem::replace(last_section, next_section);
+            let after = core::mem::replace(last_section, next_section);
             let before = next_section;
             reencoder.intersperse_section_hook(module, after, before)
         }
 
+        // Convert from `range` to a byte range within `data` while
+        // accounting for various offsets. Then create a
+        // `CodeSectionReader` (which notably the payload does not
+        // give us here) and recurse with that. This means that
+        // users overridding `parse_code_section` always get that
+        // function called.
         let orig_offset = parser.offset() as usize;
+        let get_original_section = |range: Range<usize>| {
+            data.get(range.start - orig_offset..range.end - orig_offset)
+                .ok_or(Error::InvalidCodeSectionSize)
+        };
         let mut last_section = None;
 
         for section in parser.parse_all(data) {
@@ -765,11 +796,7 @@ pub mod utils {
                     // give us here) and recurse with that. This means that
                     // users overridding `parse_code_section` always get that
                     // function called.
-                    let section = match data.get(range.start - orig_offset..range.end - orig_offset)
-                    {
-                        Some(section) => section,
-                        None => return Err(Error::InvalidCodeSectionSize),
-                    };
+                    let section = get_original_section(range.clone())?;
                     let reader = wasmparser::BinaryReader::new(section, range.start);
                     let section = wasmparser::CodeSectionReader::new(reader)?;
                     reencoder.parse_code_section(&mut codes, section)?;
@@ -781,6 +808,7 @@ pub mod utils {
                 // that we just skip all these payloads.
                 wasmparser::Payload::CodeSectionEntry(_) => {}
 
+                #[cfg(feature = "component-model")]
                 wasmparser::Payload::ModuleSection { .. }
                 | wasmparser::Payload::InstanceSection(_)
                 | wasmparser::Payload::CoreTypeSection(_)
@@ -797,12 +825,17 @@ pub mod utils {
                 wasmparser::Payload::CustomSection(section) => {
                     reencoder.parse_custom_section(module, section)?;
                 }
-                wasmparser::Payload::UnknownSection { id, contents, .. } => {
-                    reencoder.parse_unknown_section(module, id, contents)?;
-                }
                 wasmparser::Payload::End(_) => {
                     handle_intersperse_section_hook(reencoder, module, &mut last_section, None)?;
                 }
+
+                other => match other.as_section() {
+                    Some((id, range)) => {
+                        let section = get_original_section(range)?;
+                        reencoder.parse_unknown_section(module, id, section)?;
+                    }
+                    None => unreachable!(),
+                },
             }
         }
 
@@ -880,6 +913,21 @@ pub mod utils {
             },
             wasmparser::Catch::All { label } => crate::Catch::All { label },
             wasmparser::Catch::AllRef { label } => crate::Catch::AllRef { label },
+        }
+    }
+
+    pub fn handle<T: ?Sized + Reencode>(
+        reencoder: &mut T,
+        arg: wasmparser::Handle,
+    ) -> crate::Handle {
+        match arg {
+            wasmparser::Handle::OnLabel { tag, label } => crate::Handle::OnLabel {
+                tag: reencoder.tag_index(tag),
+                label,
+            },
+            wasmparser::Handle::OnSwitch { tag } => crate::Handle::OnSwitch {
+                tag: reencoder.tag_index(tag),
+            },
         }
     }
 
@@ -989,6 +1037,8 @@ pub mod utils {
             I31 => crate::AbstractHeapType::I31,
             Exn => crate::AbstractHeapType::Exn,
             NoExn => crate::AbstractHeapType::NoExn,
+            Cont => crate::AbstractHeapType::Cont,
+            NoCont => crate::AbstractHeapType::NoCont,
         }
     }
 
@@ -1052,6 +1102,9 @@ pub mod utils {
             wasmparser::CompositeInnerType::Struct(s) => {
                 crate::CompositeInnerType::Struct(reencoder.struct_type(s)?)
             }
+            wasmparser::CompositeInnerType::Cont(c) => {
+                crate::CompositeInnerType::Cont(reencoder.cont_type(c)?)
+            }
         };
         Ok(crate::CompositeType {
             inner,
@@ -1112,6 +1165,15 @@ pub mod utils {
             wasmparser::StorageType::I16 => crate::StorageType::I16,
             wasmparser::StorageType::Val(v) => crate::StorageType::Val(reencoder.val_type(v)?),
         })
+    }
+
+    pub fn cont_type<T: ?Sized + Reencode>(
+        reencoder: &mut T,
+        cont_ty: wasmparser::ContType,
+    ) -> Result<crate::ContType, Error<T::Error>> {
+        Ok(crate::ContType(
+            reencoder.type_index_unpacked(cont_ty.0.unpack())?,
+        ))
     }
 
     pub fn val_type<T: ?Sized + Reencode>(
@@ -1498,7 +1560,7 @@ pub mod utils {
         use crate::Instruction;
 
         macro_rules! translate {
-            ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident)*) => {
+            ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident ($($ann:tt)*))*) => {
                 Ok(match arg {
                     $(
                         wasmparser::Operator::$op $({ $($arg),* })? => {
@@ -1508,6 +1570,7 @@ pub mod utils {
                             translate!(build $op $($($arg)*)?)
                         }
                     )*
+                    unexpected => unreachable!("encountered unexpected Wasm operator: {unexpected:?}"),
                 })
             };
 
@@ -1555,6 +1618,12 @@ pub mod utils {
             (map $arg:ident array_size) => ($arg);
             (map $arg:ident field_index) => ($arg);
             (map $arg:ident try_table) => ($arg);
+            (map $arg:ident argument_index) => (reencoder.type_index($arg));
+            (map $arg:ident result_index) => (reencoder.type_index($arg));
+            (map $arg:ident cont_type_index) => (reencoder.type_index($arg));
+            (map $arg:ident resume_table) => ((
+                $arg.handlers.into_iter().map(|h| reencoder.handle(h)).collect::<Vec<_>>().into()
+            ));
 
             // This case takes the arguments of a wasmparser instruction and creates
             // a wasm-encoder instruction. There are a few special cases for where
@@ -1782,6 +1851,12 @@ impl TryFrom<wasmparser::GlobalType> for crate::GlobalType {
 
     fn try_from(global_ty: wasmparser::GlobalType) -> Result<Self, Self::Error> {
         RoundtripReencoder.global_type(global_ty)
+    }
+}
+
+impl From<wasmparser::Handle> for crate::Handle {
+    fn from(arg: wasmparser::Handle) -> Self {
+        RoundtripReencoder.handle(arg)
     }
 }
 

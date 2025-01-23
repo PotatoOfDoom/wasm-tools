@@ -10,6 +10,8 @@ use super::{
     operators::{ty_to_str, OperatorValidator, OperatorValidatorAllocations},
     types::{CoreTypeId, EntityType, RecGroupId, TypeAlloc, TypeList},
 };
+#[cfg(feature = "simd")]
+use crate::VisitSimdOperator;
 use crate::{
     limits::*, BinaryReaderError, ConstExpr, Data, DataKind, Element, ElementKind, ExternalKind,
     FuncType, Global, GlobalType, HeapType, MemoryType, RecGroup, RefType, Result, SubType, Table,
@@ -408,10 +410,17 @@ impl ModuleState {
                         .insert(index);
                 }
             }
+
+            fn not_const(&self, instr: &str) -> BinaryReaderError {
+                BinaryReaderError::new(
+                    format!("constant expression required: non-constant operator: {instr}"),
+                    self.offset,
+                )
+            }
         }
 
         macro_rules! define_visit_operator {
-            ($(@$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident)*) => {
+            ($(@$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident ($($ann:tt)*))*) => {
                 $(
                     #[allow(unused_variables)]
                     fn $visit(&mut self $($(,$arg: $argty)*)?) -> Self::Output {
@@ -434,7 +443,7 @@ impl ModuleState {
                 $self.validator().visit_f64_const($val)
             }};
             (@visit $self:ident visit_v128_const $val:ident) => {{
-                $self.validator().visit_v128_const($val)
+                $self.validator().simd_visitor().unwrap().visit_v128_const($val)
             }};
             (@visit $self:ident visit_ref_null $val:ident) => {{
                 $self.validator().visit_ref_null($val)
@@ -515,17 +524,26 @@ impl ModuleState {
             }};
 
             (@visit $self:ident $op:ident $($args:tt)*) => {{
-                Err(BinaryReaderError::new(
-                    format!("constant expression required: non-constant operator: {}", stringify!($op)),
-                    $self.offset,
-                ))
+                Err($self.not_const(stringify!($op)))
             }}
         }
 
         impl<'a> VisitOperator<'a> for VisitConstOperator<'a> {
             type Output = Result<()>;
 
-            for_each_operator!(define_visit_operator);
+            #[cfg(feature = "simd")]
+            fn simd_visitor(
+                &mut self,
+            ) -> Option<&mut dyn crate::VisitSimdOperator<'a, Output = Self::Output>> {
+                Some(self)
+            }
+
+            crate::for_each_visit_operator!(define_visit_operator);
+        }
+
+        #[cfg(feature = "simd")]
+        impl<'a> VisitSimdOperator<'a> for VisitConstOperator<'a> {
+            crate::for_each_visit_simd_operator!(define_visit_operator);
         }
     }
 }
@@ -555,7 +573,7 @@ pub(crate) struct Module {
 }
 
 impl Module {
-    pub fn add_types(
+    pub(crate) fn add_types(
         &mut self,
         rec_group: RecGroup,
         features: &WasmFeatures,
@@ -764,12 +782,6 @@ impl Module {
         }
 
         self.check_limits(ty.initial, ty.maximum, offset)?;
-        if ty.initial > MAX_WASM_TABLE_ENTRIES as u64 {
-            return Err(BinaryReaderError::new(
-                "minimum table size is out of bounds",
-                offset,
-            ));
-        }
 
         if ty.shared {
             if !features.shared_everything_threads() {
@@ -865,6 +877,7 @@ impl Module {
         Ok(())
     }
 
+    #[cfg(feature = "component-model")]
     pub(crate) fn imports_for_module_type(
         &self,
         offset: usize,
@@ -949,7 +962,7 @@ impl Module {
             ));
         }
         let ty = self.func_type_at(ty.func_type_idx, types, offset)?;
-        if !ty.results().is_empty() {
+        if !ty.results().is_empty() && !features.stack_switching() {
             return Err(BinaryReaderError::new(
                 "invalid exception type: non-empty tag result type",
                 offset,
@@ -1168,6 +1181,10 @@ impl WasmModuleResources for OperatorValidatorResources<'_> {
         Some(&self.types[id])
     }
 
+    fn sub_type_at_id(&self, at: CoreTypeId) -> &SubType {
+        &self.types[at]
+    }
+
     fn type_id_of_function(&self, at: u32) -> Option<CoreTypeId> {
         let type_index = self.module.functions.get(at as usize)?;
         self.module.types.get(*type_index as usize).copied()
@@ -1241,6 +1258,11 @@ impl WasmModuleResources for ValidatorResources {
         let id = *self.0.types.get(at as usize)?;
         let types = self.0.snapshot.as_ref().unwrap();
         Some(&types[id])
+    }
+
+    fn sub_type_at_id(&self, at: CoreTypeId) -> &SubType {
+        let types = self.0.snapshot.as_ref().unwrap();
+        &types[at]
     }
 
     fn type_id_of_function(&self, at: u32) -> Option<CoreTypeId> {

@@ -16,8 +16,7 @@
 use crate::prelude::*;
 use crate::{
     limits::*, AbstractHeapType, BinaryReaderError, Encoding, FromReader, FunctionBody, HeapType,
-    Parser, Payload, RefType, Result, SectionLimited, ValType, WasmFeatures,
-    WASM_COMPONENT_VERSION, WASM_MODULE_VERSION,
+    Parser, Payload, RefType, Result, SectionLimited, ValType, WasmFeatures, WASM_MODULE_VERSION,
 };
 use ::core::mem;
 use ::core::ops::Range;
@@ -55,19 +54,24 @@ fn test_validate() {
     assert!(validate(&[0x0, 0x61, 0x73, 0x6d, 0x2, 0x0, 0x0, 0x0]).is_err());
 }
 
+#[cfg(feature = "component-model")]
 mod component;
+#[cfg(feature = "component-model")]
+pub mod component_types;
 mod core;
 mod func;
+#[cfg(feature = "component-model")]
 pub mod names;
 mod operators;
 pub mod types;
 
+#[cfg(feature = "component-model")]
 use self::component::*;
 pub use self::core::ValidatorResources;
 use self::core::*;
 use self::types::{TypeAlloc, Types, TypesRef};
 pub use func::{FuncToValidate, FuncValidator, FuncValidatorAllocations};
-pub use operators::{Frame, FrameKind};
+pub use operators::Frame;
 
 fn check_max(cur_len: usize, amt_added: u32, max: usize, desc: &str, offset: usize) -> Result<()> {
     if max
@@ -152,6 +156,7 @@ pub struct Validator {
 
     /// With the component model enabled, this stores the pushed component states.
     /// The top of the stack is the current component state.
+    #[cfg(feature = "component-model")]
     components: Vec<ComponentState>,
 
     /// Enabled WebAssembly feature flags, dictating what's valid and what
@@ -173,6 +178,7 @@ enum State {
     ///
     /// The associated component state exists at the top of the
     /// validator's [`Validator::components`] stack.
+    #[cfg(feature = "component-model")]
     Component,
     /// The parse has completed and no more data is expected.
     End,
@@ -181,7 +187,9 @@ enum State {
 impl State {
     fn ensure_parsable(&self, offset: usize) -> Result<()> {
         match self {
-            Self::Module | Self::Component => Ok(()),
+            Self::Module => Ok(()),
+            #[cfg(feature = "component-model")]
+            Self::Component => Ok(()),
             Self::Unparsed(_) => Err(BinaryReaderError::new(
                 "unexpected section before header was parsed",
                 offset,
@@ -195,9 +203,11 @@ impl State {
 
     fn ensure_module(&self, section: &str, offset: usize) -> Result<()> {
         self.ensure_parsable(offset)?;
+        let _ = section;
 
         match self {
             Self::Module => Ok(()),
+            #[cfg(feature = "component-model")]
             Self::Component => Err(format_err!(
                 offset,
                 "unexpected module {section} section while parsing a component",
@@ -206,6 +216,7 @@ impl State {
         }
     }
 
+    #[cfg(feature = "component-model")]
     fn ensure_component(&self, section: &str, offset: usize) -> Result<()> {
         self.ensure_parsable(offset)?;
 
@@ -317,6 +328,15 @@ impl WasmFeatures {
                             Err("exception refs not supported without the exception handling feature")
                         }
                     }
+
+                    // These types were added in the stack switching proposal.
+                    (Cont | NoCont, _) => {
+                        if self.stack_switching() {
+                            Ok(())
+                        } else {
+                            Err("continuation refs not supported without the stack switching feature")
+                        }
+                    }
                 }
             }
         }
@@ -400,7 +420,7 @@ impl Validator {
     ///
     /// // Validate the first Wasm module and get the ID of its type.
     /// let types = validator.validate_all(&wasm1)?;
-    /// let id1 = types.core_type_at(0);
+    /// let id1 = types.as_ref().core_type_at_in_module(0);
     ///
     /// // Reset the validator so we can parse the second wasm module inside
     /// // this validator's same context.
@@ -409,14 +429,14 @@ impl Validator {
     /// // Validate the second Wasm module and get the ID of its second type,
     /// // which is the same type as the first Wasm module's only type.
     /// let types = validator.validate_all(&wasm2)?;
-    /// let id2 = types.core_type_at(1);
+    /// let id2 = types.as_ref().core_type_at_in_module(1);
     ///
     /// // Because both modules were processed in the same `Validator`, they
     /// // share the same types context and therefore the same type defined
     /// // multiple times across different modules will be deduplicated and
     /// // assigned the same identifier!
     /// assert_eq!(id1, id2);
-    /// assert_eq!(types[id1.unwrap_sub()], types[id2.unwrap_sub()]);
+    /// assert_eq!(types[id1], types[id2]);
     /// # Ok(())
     /// # }
     /// # foo().unwrap()
@@ -440,6 +460,7 @@ impl Validator {
 
             state,
             module,
+            #[cfg(feature = "component-model")]
             components,
         } = self;
 
@@ -448,6 +469,7 @@ impl Validator {
             "cannot reset a validator that did not successfully complete validation"
         );
         assert!(module.is_none());
+        #[cfg(feature = "component-model")]
         assert!(components.is_empty());
 
         *state = State::default();
@@ -516,13 +538,18 @@ impl Validator {
                 return Some(TypesRef::from_module(self.id, &self.types, &module.module));
             } else {
                 level -= 1;
+                let _ = level;
             }
         }
 
-        self.components
+        #[cfg(feature = "component-model")]
+        return self
+            .components
             .iter()
             .nth_back(level)
-            .map(|component| TypesRef::from_component(self.id, &self.types, component))
+            .map(|component| TypesRef::from_component(self.id, &self.types, component));
+        #[cfg(not(feature = "component-model"))]
+        return None;
     }
 
     /// Convenience function to validate a single [`Payload`].
@@ -571,6 +598,7 @@ impl Validator {
             DataSection(s) => self.data_section(s)?,
 
             // Component sections
+            #[cfg(feature = "component-model")]
             ModuleSection {
                 parser,
                 unchecked_range: range,
@@ -579,8 +607,11 @@ impl Validator {
                 self.module_section(range)?;
                 return Ok(ValidPayload::Parser(parser.clone()));
             }
+            #[cfg(feature = "component-model")]
             InstanceSection(s) => self.instance_section(s)?,
+            #[cfg(feature = "component-model")]
             CoreTypeSection(s) => self.core_type_section(s)?,
+            #[cfg(feature = "component-model")]
             ComponentSection {
                 parser,
                 unchecked_range: range,
@@ -589,12 +620,19 @@ impl Validator {
                 self.component_section(range)?;
                 return Ok(ValidPayload::Parser(parser.clone()));
             }
+            #[cfg(feature = "component-model")]
             ComponentInstanceSection(s) => self.component_instance_section(s)?,
+            #[cfg(feature = "component-model")]
             ComponentAliasSection(s) => self.component_alias_section(s)?,
+            #[cfg(feature = "component-model")]
             ComponentTypeSection(s) => self.component_type_section(s)?,
+            #[cfg(feature = "component-model")]
             ComponentCanonicalSection(s) => self.component_canonical_section(s)?,
+            #[cfg(feature = "component-model")]
             ComponentStartSection { start, range } => self.component_start_section(start, range)?,
+            #[cfg(feature = "component-model")]
             ComponentImportSection(s) => self.component_import_section(s)?,
+            #[cfg(feature = "component-model")]
             ComponentExportSection(s) => self.component_export_section(s)?,
 
             End(offset) => return Ok(ValidPayload::End(self.end(*offset)?)),
@@ -649,15 +687,22 @@ impl Validator {
                         is not enabled - enable the feature to allow component validation",
                     );
                 }
-                if num == WASM_COMPONENT_VERSION {
+                #[cfg(feature = "component-model")]
+                if num == crate::WASM_COMPONENT_VERSION {
                     self.components
                         .push(ComponentState::new(ComponentKind::Component));
                     State::Component
-                } else if num < WASM_COMPONENT_VERSION {
+                } else if num < crate::WASM_COMPONENT_VERSION {
                     bail!(range.start, "unsupported component version: {num:#x}");
                 } else {
                     bail!(range.start, "unknown component version: {num:#x}");
                 }
+                #[cfg(not(feature = "component-model"))]
+                bail!(
+                    range.start,
+                    "component model validation support disabled \
+                     at compile time"
+                );
             }
         };
 
@@ -1038,6 +1083,7 @@ impl Validator {
     /// Validates [`Payload::ModuleSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn module_section(&mut self, range: &Range<usize>) -> Result<()> {
         self.state.ensure_component("module", range.start)?;
 
@@ -1061,6 +1107,7 @@ impl Validator {
     /// Validates [`Payload::InstanceSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn instance_section(&mut self, section: &crate::InstanceSectionReader) -> Result<()> {
         self.process_component_section(
             section,
@@ -1089,6 +1136,7 @@ impl Validator {
     /// Validates [`Payload::CoreTypeSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn core_type_section(&mut self, section: &crate::CoreTypeSectionReader<'_>) -> Result<()> {
         self.process_component_section(
             section,
@@ -1110,6 +1158,7 @@ impl Validator {
     /// Validates [`Payload::ComponentSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn component_section(&mut self, range: &Range<usize>) -> Result<()> {
         self.state.ensure_component("component", range.start)?;
 
@@ -1133,6 +1182,7 @@ impl Validator {
     /// Validates [`Payload::ComponentInstanceSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn component_instance_section(
         &mut self,
         section: &crate::ComponentInstanceSectionReader,
@@ -1164,6 +1214,7 @@ impl Validator {
     /// Validates [`Payload::ComponentAliasSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn component_alias_section(
         &mut self,
         section: &crate::ComponentAliasSectionReader<'_>,
@@ -1181,6 +1232,7 @@ impl Validator {
     /// Validates [`Payload::ComponentTypeSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn component_type_section(
         &mut self,
         section: &crate::ComponentTypeSectionReader,
@@ -1205,6 +1257,7 @@ impl Validator {
     /// Validates [`Payload::ComponentCanonicalSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn component_canonical_section(
         &mut self,
         section: &crate::ComponentCanonicalSectionReader,
@@ -1237,11 +1290,18 @@ impl Validator {
                         options.into_vec(),
                         types,
                         offset,
+                        features,
                     ),
                     crate::CanonicalFunction::Lower {
                         func_index,
                         options,
-                    } => current.lower_function(func_index, options.into_vec(), types, offset),
+                    } => current.lower_function(
+                        func_index,
+                        options.into_vec(),
+                        types,
+                        offset,
+                        features,
+                    ),
                     crate::CanonicalFunction::ResourceNew { resource } => {
                         current.resource_new(resource, types, offset)
                     }
@@ -1257,6 +1317,74 @@ impl Validator {
                     crate::CanonicalFunction::ThreadHwConcurrency => {
                         current.thread_hw_concurrency(types, offset, features)
                     }
+                    crate::CanonicalFunction::TaskBackpressure => {
+                        current.task_backpressure(types, offset, features)
+                    }
+                    crate::CanonicalFunction::TaskReturn { type_index } => {
+                        current.task_return(type_index, types, offset, features)
+                    }
+                    crate::CanonicalFunction::TaskWait { async_, memory } => {
+                        current.task_wait(async_, memory, types, offset, features)
+                    }
+                    crate::CanonicalFunction::TaskPoll { async_, memory } => {
+                        current.task_poll(async_, memory, types, offset, features)
+                    }
+                    crate::CanonicalFunction::TaskYield { async_ } => {
+                        current.task_yield(async_, types, offset, features)
+                    }
+                    crate::CanonicalFunction::SubtaskDrop => {
+                        current.subtask_drop(types, offset, features)
+                    }
+                    crate::CanonicalFunction::StreamNew { ty } => {
+                        current.stream_new(ty, types, offset, features)
+                    }
+                    crate::CanonicalFunction::StreamRead { ty, options } => {
+                        current.stream_read(ty, options.into_vec(), types, offset, features)
+                    }
+                    crate::CanonicalFunction::StreamWrite { ty, options } => {
+                        current.stream_write(ty, options.into_vec(), types, offset, features)
+                    }
+                    crate::CanonicalFunction::StreamCancelRead { ty, async_ } => {
+                        current.stream_cancel_read(ty, async_, types, offset, features)
+                    }
+                    crate::CanonicalFunction::StreamCancelWrite { ty, async_ } => {
+                        current.stream_cancel_write(ty, async_, types, offset, features)
+                    }
+                    crate::CanonicalFunction::StreamCloseReadable { ty } => {
+                        current.stream_close_readable(ty, types, offset, features)
+                    }
+                    crate::CanonicalFunction::StreamCloseWritable { ty } => {
+                        current.stream_close_writable(ty, types, offset, features)
+                    }
+                    crate::CanonicalFunction::FutureNew { ty } => {
+                        current.future_new(ty, types, offset, features)
+                    }
+                    crate::CanonicalFunction::FutureRead { ty, options } => {
+                        current.future_read(ty, options.into_vec(), types, offset, features)
+                    }
+                    crate::CanonicalFunction::FutureWrite { ty, options } => {
+                        current.future_write(ty, options.into_vec(), types, offset, features)
+                    }
+                    crate::CanonicalFunction::FutureCancelRead { ty, async_ } => {
+                        current.future_cancel_read(ty, async_, types, offset, features)
+                    }
+                    crate::CanonicalFunction::FutureCancelWrite { ty, async_ } => {
+                        current.future_cancel_write(ty, async_, types, offset, features)
+                    }
+                    crate::CanonicalFunction::FutureCloseReadable { ty } => {
+                        current.future_close_readable(ty, types, offset, features)
+                    }
+                    crate::CanonicalFunction::FutureCloseWritable { ty } => {
+                        current.future_close_writable(ty, types, offset, features)
+                    }
+                    crate::CanonicalFunction::ErrorContextNew { options } => {
+                        current.error_context_new(options.into_vec(), types, offset, features)
+                    }
+                    crate::CanonicalFunction::ErrorContextDebugMessage { options } => current
+                        .error_context_debug_message(options.into_vec(), types, offset, features),
+                    crate::CanonicalFunction::ErrorContextDrop => {
+                        current.error_context_drop(types, offset, features)
+                    }
                 }
             },
         )
@@ -1265,6 +1393,7 @@ impl Validator {
     /// Validates [`Payload::ComponentStartSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn component_start_section(
         &mut self,
         f: &crate::ComponentStartFunction,
@@ -1285,6 +1414,7 @@ impl Validator {
     /// Validates [`Payload::ComponentImportSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn component_import_section(
         &mut self,
         section: &crate::ComponentImportSectionReader,
@@ -1305,6 +1435,7 @@ impl Validator {
     /// Validates [`Payload::ComponentExportSection`](crate::Payload).
     ///
     /// This method should only be called when parsing a component.
+    #[cfg(feature = "component-model")]
     pub fn component_export_section(
         &mut self,
         section: &crate::ComponentExportSectionReader,
@@ -1365,6 +1496,7 @@ impl Validator {
 
                 // If there's a parent component, we'll add a module to the parent state
                 // and continue to validate the component
+                #[cfg(feature = "component-model")]
                 if let Some(parent) = self.components.last_mut() {
                     parent.add_core_module(&state.module, &mut self.types, offset)?;
                     self.state = State::Component;
@@ -1376,6 +1508,7 @@ impl Validator {
                     state.module.arc().clone(),
                 ))
             }
+            #[cfg(feature = "component-model")]
             State::Component => {
                 let mut component = self.components.pop().unwrap();
 
@@ -1450,6 +1583,7 @@ impl Validator {
         Ok(())
     }
 
+    #[cfg(feature = "component-model")]
     fn process_component_section<'a, T>(
         &mut self,
         section: &SectionLimited<'a, T>,
@@ -1528,12 +1662,13 @@ mod tests {
             Validator::new_with_features(WasmFeatures::default() | WasmFeatures::EXCEPTIONS);
 
         let types = validator.validate_all(&bytes)?;
+        let types = types.as_ref();
 
-        assert_eq!(types.type_count(), 2);
+        assert_eq!(types.core_type_count_in_module(), 2);
         assert_eq!(types.memory_count(), 1);
         assert_eq!(types.table_count(), 1);
         assert_eq!(types.global_count(), 1);
-        assert_eq!(types.core_function_count(), 1);
+        assert_eq!(types.function_count(), 1);
         assert_eq!(types.tag_count(), 1);
         assert_eq!(types.element_count(), 1);
         assert_eq!(types.module_count(), 0);
@@ -1541,18 +1676,12 @@ mod tests {
         assert_eq!(types.core_instance_count(), 0);
         assert_eq!(types.value_count(), 0);
 
-        let id = match types.core_type_at(0) {
-            crate::types::ComponentCoreTypeId::Sub(s) => s,
-            crate::types::ComponentCoreTypeId::Module(_) => panic!(),
-        };
+        let id = types.core_type_at_in_module(0);
         let ty = types[id].unwrap_func();
         assert_eq!(ty.params(), [ValType::I32, ValType::I64]);
         assert_eq!(ty.results(), [ValType::I32]);
 
-        let id = match types.core_type_at(1) {
-            crate::types::ComponentCoreTypeId::Sub(s) => s,
-            crate::types::ComponentCoreTypeId::Module(_) => panic!(),
-        };
+        let id = types.core_type_at_in_module(1);
         let ty = types[id].unwrap_func();
         assert_eq!(ty.params(), [ValType::I64, ValType::I32]);
         assert_eq!(ty.results(), []);
@@ -1619,6 +1748,7 @@ mod tests {
             Validator::new_with_features(WasmFeatures::default() | WasmFeatures::COMPONENT_MODEL);
 
         let types = validator.validate_all(&bytes)?;
+        let types = types.as_ref();
 
         let t_id = types.component_defined_type_at(0);
         let a1_id = types.component_defined_type_at(1);
@@ -1652,6 +1782,7 @@ mod tests {
             Validator::new_with_features(WasmFeatures::default() | WasmFeatures::COMPONENT_MODEL);
 
         let types = validator.validate_all(&bytes)?;
+        let types = types.as_ref();
 
         let t_id = types.component_defined_type_at(0);
         let a1_id = types.component_defined_type_at(1);

@@ -1,4 +1,5 @@
-use anyhow::{Context, Result};
+use crate::abi::AbiVariant;
+use anyhow::{bail, Context, Result};
 use id_arena::{Arena, Id};
 use indexmap::IndexMap;
 use semver::Version;
@@ -21,7 +22,7 @@ pub use ast::{parse_use_path, ParsedUsePath};
 mod sizealign;
 pub use sizealign::*;
 mod resolve;
-pub use resolve::{Package, PackageId, Remap, Resolve};
+pub use resolve::*;
 mod live;
 pub use live::{LiveTypes, TypeIdVisitor};
 
@@ -147,7 +148,7 @@ struct InterfaceSpan {
 
 #[derive(Debug, Copy, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum AstItem {
     #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
     Interface(InterfaceId),
@@ -189,6 +190,53 @@ impl PackageName {
         }
         s
     }
+
+    /// Determines the "semver compatible track" for the given version.
+    ///
+    /// This method implements the logic from the component model where semver
+    /// versions can be compatible with one another. For example versions 1.2.0
+    /// and 1.2.1 would be considered both compatible with one another because
+    /// they're on the same semver compatible track.
+    ///
+    /// This predicate is used during
+    /// [`Resolve::merge_world_imports_based_on_semver`] for example to
+    /// determine whether two imports can be merged together. This is
+    /// additionally used when creating components to match up imports in
+    /// core wasm to imports in worlds.
+    pub fn version_compat_track(version: &Version) -> Version {
+        let mut version = version.clone();
+        version.build = semver::BuildMetadata::EMPTY;
+        if !version.pre.is_empty() {
+            return version;
+        }
+        if version.major != 0 {
+            version.minor = 0;
+            version.patch = 0;
+            return version;
+        }
+        if version.minor != 0 {
+            version.patch = 0;
+            return version;
+        }
+        version
+    }
+
+    /// Returns the string corresponding to
+    /// [`PackageName::version_compat_track`]. This is done to match the
+    /// component model's expected naming scheme of imports and exports.
+    pub fn version_compat_track_string(version: &Version) -> String {
+        let version = Self::version_compat_track(version);
+        if !version.pre.is_empty() {
+            return version.to_string();
+        }
+        if version.major != 0 {
+            return format!("{}", version.major);
+        }
+        if version.minor != 0 {
+            return format!("{}.{}", version.major, version.minor);
+        }
+        version.to_string()
+    }
 }
 
 impl fmt::Display for PackageName {
@@ -225,6 +273,52 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[derive(Debug)]
+struct PackageNotFoundError {
+    span: Span,
+    requested: PackageName,
+    known: Vec<PackageName>,
+    highlighted: Option<String>,
+}
+
+impl PackageNotFoundError {
+    pub fn new(span: Span, requested: PackageName, known: Vec<PackageName>) -> Self {
+        Self {
+            span,
+            requested,
+            known,
+            highlighted: None,
+        }
+    }
+}
+
+impl fmt::Display for PackageNotFoundError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(highlighted) = &self.highlighted {
+            return highlighted.fmt(f);
+        }
+        if self.known.is_empty() {
+            write!(
+                f,
+                "package '{}' not found. no known packages.",
+                self.requested
+            )?;
+        } else {
+            write!(
+                f,
+                "package '{}' not found. known packages:\n",
+                self.requested
+            )?;
+            for known in self.known.iter() {
+                write!(f, "    {known}\n")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PackageNotFoundError {}
 
 impl UnresolvedPackageGroup {
     /// Parses the given string as a wit document.
@@ -377,7 +471,7 @@ impl WorldKey {
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum WorldItem {
     /// An interface is being imported or exported from a world, indicating that
     /// it's a namespace of functions.
@@ -463,7 +557,7 @@ pub struct TypeDef {
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum TypeDefKind {
     Record(Record),
     Resource,
@@ -476,7 +570,8 @@ pub enum TypeDefKind {
     Result(Result_),
     List(Type),
     Future(Option<Type>),
-    Stream(Stream),
+    Stream(Option<Type>),
+    ErrorContext,
     Type(Type),
 
     /// This represents a type of unknown structure imported from a foreign
@@ -505,6 +600,7 @@ impl TypeDefKind {
             TypeDefKind::List(_) => "list",
             TypeDefKind::Future(_) => "future",
             TypeDefKind::Stream(_) => "stream",
+            TypeDefKind::ErrorContext => "error-context",
             TypeDefKind::Type(_) => "type",
             TypeDefKind::Unknown => "unknown",
         }
@@ -513,7 +609,7 @@ impl TypeDefKind {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum TypeOwner {
     /// This type was defined within a `world` block.
     #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
@@ -529,7 +625,7 @@ pub enum TypeOwner {
 
 #[derive(Debug, PartialEq, Eq, Hash, Copy, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum Handle {
     #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
     Own(TypeId),
@@ -687,13 +783,6 @@ pub struct Result_ {
     pub err: Option<Type>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize))]
-pub struct Stream {
-    pub element: Option<Type>,
-    pub end: Option<Type>,
-}
-
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Docs {
@@ -797,7 +886,7 @@ pub struct Function {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum FunctionKind {
     Freestanding,
     #[cfg_attr(feature = "serde", serde(serialize_with = "serialize_id"))]
@@ -816,6 +905,117 @@ impl FunctionKind {
             FunctionKind::Method(id) | FunctionKind::Static(id) | FunctionKind::Constructor(id) => {
                 Some(*id)
             }
+        }
+    }
+}
+
+/// Possible forms of name mangling that are supported by this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Mangling {
+    /// The "standard" component model mangling format for 32-bit linear
+    /// memories. This is specified in WebAssembly/component-model#378
+    Standard32,
+
+    /// The "legacy" name mangling supported in versions 218-and-prior for this
+    /// crate. This is the original support for how components were created from
+    /// core wasm modules and this does not correspond to any standard. This is
+    /// preserved for now while tools transition to the new scheme.
+    Legacy,
+}
+
+impl std::str::FromStr for Mangling {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Mangling> {
+        match s {
+            "legacy" => Ok(Mangling::Legacy),
+            "standard32" => Ok(Mangling::Standard32),
+            _ => {
+                bail!(
+                    "unknown name mangling `{s}`, \
+                     supported values are `legacy` or `standard32`"
+                )
+            }
+        }
+    }
+}
+
+/// Possible lift/lower ABI choices supported when mangling names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LiftLowerAbi {
+    /// Both imports and exports will use the synchronous ABI.
+    Sync,
+
+    /// Both imports and exports will use the async ABI (with a callback for
+    /// each export).
+    AsyncCallback,
+
+    /// Both imports and exports will use the async ABI (with no callbacks for
+    /// exports).
+    AsyncStackful,
+}
+
+impl LiftLowerAbi {
+    fn import_prefix(self) -> &'static str {
+        match self {
+            Self::Sync => "",
+            Self::AsyncCallback | Self::AsyncStackful => "[async]",
+        }
+    }
+
+    /// Get the import [`AbiVariant`] corresponding to this [`LiftLowerAbi`]
+    pub fn import_variant(self) -> AbiVariant {
+        match self {
+            Self::Sync => AbiVariant::GuestImport,
+            Self::AsyncCallback | Self::AsyncStackful => AbiVariant::GuestImportAsync,
+        }
+    }
+
+    fn export_prefix(self) -> &'static str {
+        match self {
+            Self::Sync => "",
+            Self::AsyncCallback => "[async]",
+            Self::AsyncStackful => "[async-stackful]",
+        }
+    }
+
+    /// Get the export [`AbiVariant`] corresponding to this [`LiftLowerAbi`]
+    pub fn export_variant(self) -> AbiVariant {
+        match self {
+            Self::Sync => AbiVariant::GuestExport,
+            Self::AsyncCallback => AbiVariant::GuestExportAsync,
+            Self::AsyncStackful => AbiVariant::GuestExportAsyncStackful,
+        }
+    }
+}
+
+/// Combination of [`Mangling`] and [`LiftLowerAbi`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ManglingAndAbi {
+    /// See [`Mangling::Standard32`].
+    ///
+    /// As of this writing, the standard name mangling only supports the
+    /// synchronous ABI.
+    Standard32,
+
+    /// See [`Mangling::Legacy`] and [`LiftLowerAbi`].
+    Legacy(LiftLowerAbi),
+}
+
+impl ManglingAndAbi {
+    /// Get the import [`AbiVariant`] corresponding to this [`ManglingAndAbi`]
+    pub fn import_variant(self) -> AbiVariant {
+        match self {
+            Self::Standard32 => AbiVariant::GuestImport,
+            Self::Legacy(abi) => abi.import_variant(),
+        }
+    }
+
+    /// Get the export [`AbiVariant`] corresponding to this [`ManglingAndAbi`]
+    pub fn export_variant(self) -> AbiVariant {
+        match self {
+            Self::Standard32 => AbiVariant::GuestExport,
+            Self::Legacy(abi) => abi.export_variant(),
         }
     }
 }
@@ -843,11 +1043,109 @@ impl Function {
     }
 
     /// Gets the core export name for this function.
-    pub fn core_export_name<'a>(&'a self, interface: Option<&str>) -> Cow<'a, str> {
+    pub fn standard32_core_export_name<'a>(&'a self, interface: Option<&str>) -> Cow<'a, str> {
+        self.core_export_name(interface, Mangling::Standard32)
+    }
+
+    pub fn legacy_core_export_name<'a>(&'a self, interface: Option<&str>) -> Cow<'a, str> {
+        self.core_export_name(interface, Mangling::Legacy)
+    }
+    /// Gets the core export name for this function.
+    pub fn core_export_name<'a>(
+        &'a self,
+        interface: Option<&str>,
+        mangling: Mangling,
+    ) -> Cow<'a, str> {
         match interface {
-            Some(interface) => Cow::Owned(format!("{interface}#{}", self.name)),
-            None => Cow::Borrowed(&self.name),
+            Some(interface) => match mangling {
+                Mangling::Standard32 => Cow::Owned(format!("cm32p2|{interface}|{}", self.name)),
+                Mangling::Legacy => Cow::Owned(format!("{interface}#{}", self.name)),
+            },
+            None => match mangling {
+                Mangling::Standard32 => Cow::Owned(format!("cm32p2||{}", self.name)),
+                Mangling::Legacy => Cow::Borrowed(&self.name),
+            },
         }
+    }
+    /// Collect any future and stream types appearing in the signature of this
+    /// function by doing a depth-first search over the parameter types and then
+    /// the result types.
+    ///
+    /// For example, given the WIT function `foo: func(x: future<future<u32>>,
+    /// y: u32) -> stream<u8>`, we would return `[future<u32>,
+    /// future<future<u32>>, stream<u8>]`.
+    ///
+    /// This may be used by binding generators to refer to specific `future` and
+    /// `stream` types when importing canonical built-ins such as `stream.new`,
+    /// `future.read`, etc.  Using the example above, the import
+    /// `[future-new-0]foo` would indicate a call to `future.new` for the type
+    /// `future<u32>`.  Likewise, `[future-new-1]foo` would indicate a call to
+    /// `future.new` for `future<future<u32>>`, and `[stream-new-2]foo` would
+    /// indicate a call to `stream.new` for `stream<u8>`.
+    pub fn find_futures_and_streams(&self, resolve: &Resolve) -> Vec<TypeId> {
+        let mut results = Vec::new();
+        for (_, ty) in self.params.iter() {
+            find_futures_and_streams(resolve, *ty, &mut results);
+        }
+        for ty in self.results.iter_types() {
+            find_futures_and_streams(resolve, *ty, &mut results);
+        }
+        results
+    }
+}
+
+fn find_futures_and_streams(resolve: &Resolve, ty: Type, results: &mut Vec<TypeId>) {
+    let Type::Id(id) = ty else {
+        return;
+    };
+
+    match &resolve.types[id].kind {
+        TypeDefKind::Resource
+        | TypeDefKind::Handle(_)
+        | TypeDefKind::Flags(_)
+        | TypeDefKind::Enum(_)
+        | TypeDefKind::ErrorContext => {}
+        TypeDefKind::Record(r) => {
+            for Field { ty, .. } in &r.fields {
+                find_futures_and_streams(resolve, *ty, results);
+            }
+        }
+        TypeDefKind::Tuple(t) => {
+            for ty in &t.types {
+                find_futures_and_streams(resolve, *ty, results);
+            }
+        }
+        TypeDefKind::Variant(v) => {
+            for Case { ty, .. } in &v.cases {
+                if let Some(ty) = ty {
+                    find_futures_and_streams(resolve, *ty, results);
+                }
+            }
+        }
+        TypeDefKind::Option(ty) | TypeDefKind::List(ty) | TypeDefKind::Type(ty) => {
+            find_futures_and_streams(resolve, *ty, results);
+        }
+        TypeDefKind::Result(r) => {
+            if let Some(ty) = r.ok {
+                find_futures_and_streams(resolve, ty, results);
+            }
+            if let Some(ty) = r.err {
+                find_futures_and_streams(resolve, ty, results);
+            }
+        }
+        TypeDefKind::Future(ty) => {
+            if let Some(ty) = ty {
+                find_futures_and_streams(resolve, *ty, results);
+            }
+            results.push(id);
+        }
+        TypeDefKind::Stream(ty) => {
+            if let Some(ty) = ty {
+                find_futures_and_streams(resolve, *ty, results);
+            }
+            results.push(id);
+        }
+        TypeDefKind::Unknown => unreachable!(),
     }
 }
 
@@ -858,7 +1156,7 @@ impl Function {
 /// annotations were added to WIT.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde_derive::Deserialize, Serialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum Stability {
     /// `@since(version = 1.2.3)`
     ///
@@ -929,5 +1227,44 @@ mod test {
         if let Ok(num_cases) = usize::try_from(0x100000000_u64) {
             assert_eq!(discriminant_type(num_cases), Int::U32);
         }
+    }
+
+    #[test]
+    fn test_find_futures_and_streams() {
+        let mut resolve = Resolve::default();
+        let t0 = resolve.types.alloc(TypeDef {
+            name: None,
+            kind: TypeDefKind::Future(Some(Type::U32)),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::Unknown,
+        });
+        let t1 = resolve.types.alloc(TypeDef {
+            name: None,
+            kind: TypeDefKind::Future(Some(Type::Id(t0))),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::Unknown,
+        });
+        let t2 = resolve.types.alloc(TypeDef {
+            name: None,
+            kind: TypeDefKind::Stream(Some(Type::U32)),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::Unknown,
+        });
+        let found = Function {
+            name: "foo".into(),
+            kind: FunctionKind::Freestanding,
+            params: vec![("p1".into(), Type::Id(t1)), ("p2".into(), Type::U32)],
+            results: Results::Anon(Type::Id(t2)),
+            docs: Docs::default(),
+            stability: Stability::Unknown,
+        }
+        .find_futures_and_streams(&resolve);
+        assert_eq!(3, found.len());
+        assert_eq!(t0, found[0]);
+        assert_eq!(t1, found[1]);
+        assert_eq!(t2, found[2]);
     }
 }

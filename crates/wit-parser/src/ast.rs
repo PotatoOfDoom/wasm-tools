@@ -1,4 +1,4 @@
-use crate::{Error, UnresolvedPackageGroup};
+use crate::{Error, PackageNotFoundError, UnresolvedPackageGroup};
 use anyhow::{bail, Context, Result};
 use lex::{Span, Token, Tokenizer};
 use semver::Version;
@@ -741,6 +741,7 @@ enum Type<'a> {
     Result(Result_<'a>),
     Future(Future<'a>),
     Stream(Stream<'a>),
+    ErrorContext(Span),
 }
 
 enum Handle<'a> {
@@ -897,8 +898,7 @@ struct Result_<'a> {
 
 struct Stream<'a> {
     span: Span,
-    element: Option<Box<Type<'a>>>,
-    end: Option<Box<Type<'a>>>,
+    ty: Option<Box<Type<'a>>>,
 }
 
 struct NamedFunc<'a> {
@@ -1403,28 +1403,20 @@ impl<'a> Type<'a> {
                 Ok(Type::Future(Future { span, ty }))
             }
 
-            // stream<T, Z>
-            // stream<_, Z>
             // stream<T>
             // stream
             Some((span, Token::Stream)) => {
-                let mut element = None;
-                let mut end = None;
+                let mut ty = None;
 
                 if tokens.eat(Token::LessThan)? {
-                    if tokens.eat(Token::Underscore)? {
-                        tokens.expect(Token::Comma)?;
-                        end = Some(Box::new(Type::parse(tokens)?));
-                    } else {
-                        element = Some(Box::new(Type::parse(tokens)?));
-                        if tokens.eat(Token::Comma)? {
-                            end = Some(Box::new(Type::parse(tokens)?));
-                        }
-                    };
+                    ty = Some(Box::new(Type::parse(tokens)?));
                     tokens.expect(Token::GreaterThan)?;
                 };
-                Ok(Type::Stream(Stream { span, element, end }))
+                Ok(Type::Stream(Stream { span, ty }))
             }
+
+            // error-context
+            Some((span, Token::ErrorContext)) => Ok(Type::ErrorContext(span)),
 
             // own<T>
             Some((_span, Token::Own)) => {
@@ -1471,7 +1463,8 @@ impl<'a> Type<'a> {
             | Type::F32(span)
             | Type::F64(span)
             | Type::Char(span)
-            | Type::String(span) => *span,
+            | Type::String(span)
+            | Type::ErrorContext(span) => *span,
             Type::Name(id) => id.span,
             Type::List(l) => l.span,
             Type::Handle(h) => h.span(),
@@ -1756,6 +1749,19 @@ impl SourceMap {
             }
         }
         if let Some(_) = err.downcast_mut::<Error>() {
+            return Err(err);
+        }
+        if let Some(notfound) = err.downcast_mut::<PackageNotFoundError>() {
+            if notfound.highlighted.is_none() {
+                let msg = self.highlight_err(
+                    notfound.span.start,
+                    Some(notfound.span.end),
+                    &format!("{notfound}"),
+                );
+                notfound.highlighted = Some(msg);
+            }
+        }
+        if let Some(_) = err.downcast_mut::<PackageNotFoundError>() {
             return Err(err);
         }
 

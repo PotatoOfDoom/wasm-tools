@@ -54,10 +54,17 @@ pub struct Opts {
     /// Available feature options can be found in the wasmparser crate:
     /// <https://github.com/bytecodealliance/wasm-tools/blob/main/crates/wasmparser/src/features.rs>
     #[clap(long, short = 'f', value_parser = parse_features)]
-    features: Option<WasmFeatures>,
+    features: Vec<Vec<FeatureAction>>,
 
     #[clap(flatten)]
     io: wasm_tools::InputOutput,
+}
+
+#[derive(Clone)]
+enum FeatureAction {
+    Reset(WasmFeatures),
+    Enable(WasmFeatures),
+    Disable(WasmFeatures),
 }
 
 impl Opts {
@@ -66,7 +73,9 @@ impl Opts {
     }
 
     pub fn run(&self) -> Result<()> {
+        let start = Instant::now();
         let wasm = self.io.parse_input_wasm()?;
+        log::info!("read module in {:?}", start.elapsed());
 
         // If validation fails then try to attach extra information to the
         // error based on DWARF information in the input wasm binary. If
@@ -90,6 +99,26 @@ impl Opts {
         }
     }
 
+    fn features(&self) -> Result<WasmFeatures> {
+        let mut ret = WasmFeatures::default();
+
+        for action in self.features.iter().flat_map(|v| v) {
+            match action {
+                FeatureAction::Enable(features) => {
+                    ret |= *features;
+                }
+                FeatureAction::Disable(features) => {
+                    ret &= !*features;
+                }
+                FeatureAction::Reset(features) => {
+                    ret = *features;
+                }
+            }
+        }
+
+        Ok(ret)
+    }
+
     fn validate(&self, wasm: &[u8]) -> Result<()> {
         // Note that here we're copying the contents of
         // `Validator::validate_all`, but the end is followed up with a parallel
@@ -101,7 +130,7 @@ impl Opts {
         // `Validator` we're using as we navigate nested modules (the module
         // linking proposal) and any functions found are deferred to get
         // validated later.
-        let mut validator = Validator::new_with_features(self.features.unwrap_or_default());
+        let mut validator = Validator::new_with_features(self.features()?);
         let mut functions_to_validate = Vec::new();
 
         let start = Instant::now();
@@ -115,21 +144,31 @@ impl Opts {
         }
         log::info!("module structure validated in {:?}", start.elapsed());
 
-        // After we've validate the entire wasm module we'll use `rayon` to iterate
-        // over all functions in parallel and perform parallel validation of the
-        // input wasm module.
+        // After we've validate the entire wasm module we'll use `rayon` to
+        // iterate over all functions in parallel and perform parallel
+        // validation of the input wasm module.
+        //
+        // Note that validation results for each function are collected into a
+        // vector to ensure that in the case of multiple errors the first is
+        // always reported. Otherwise `rayon` does not guarantee the order that
+        // failures show up in.
         let start = Instant::now();
-        functions_to_validate.into_par_iter().try_for_each_init(
-            FuncValidatorAllocations::default,
-            |allocs, (to_validate, body)| -> Result<_> {
-                let mut validator = to_validate.into_validator(mem::take(allocs));
-                validator
-                    .validate(&body)
-                    .with_context(|| format!("func {} failed to validate", validator.index()))?;
-                *allocs = validator.into_allocations();
-                Ok(())
-            },
-        )?;
+        functions_to_validate
+            .into_par_iter()
+            .map_init(
+                FuncValidatorAllocations::default,
+                |allocs, (to_validate, body)| -> Result<_> {
+                    let mut validator = to_validate.into_validator(mem::take(allocs));
+                    validator.validate(&body).with_context(|| {
+                        format!("func {} failed to validate", validator.index())
+                    })?;
+                    *allocs = validator.into_allocations();
+                    Ok(())
+                },
+            )
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
         log::info!("functions validated in {:?}", start.elapsed());
         Ok(())
     }
@@ -180,11 +219,11 @@ impl Opts {
     }
 }
 
-fn parse_features(arg: &str) -> Result<WasmFeatures> {
-    let mut ret = WasmFeatures::default();
+fn parse_features(arg: &str) -> Result<Vec<FeatureAction>> {
+    let mut ret = Vec::new();
 
     const GROUPS: &[(&str, WasmFeatures)] = &[
-        ("mvp", WasmFeatures::WASM1),
+        ("mvp", WasmFeatures::MVP),
         ("wasm1", WasmFeatures::WASM1),
         ("wasm2", WasmFeatures::WASM2),
         ("wasm3", WasmFeatures::WASM3),
@@ -224,18 +263,24 @@ fn parse_features(arg: &str) -> Result<WasmFeatures> {
             }
             match action {
                 Action::ChangeAll => {
-                    for flag in WasmFeatures::FLAGS.iter() {
-                        ret.set(*flag.value(), enable);
-                    }
+                    ret.push(if enable {
+                        FeatureAction::Enable(WasmFeatures::all())
+                    } else {
+                        FeatureAction::Disable(WasmFeatures::all())
+                    });
                 }
                 Action::Modify(feature) => {
-                    ret.set(feature, enable);
+                    ret.push(if enable {
+                        FeatureAction::Enable(feature)
+                    } else {
+                        FeatureAction::Disable(feature)
+                    });
                 }
                 Action::Group(features) => {
                     if !enable {
                         bail!("cannot disable `{part}`, it can only be enabled");
                     }
-                    ret = features;
+                    ret.push(FeatureAction::Reset(features));
                 }
             }
             continue 'outer;

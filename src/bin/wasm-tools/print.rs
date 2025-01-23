@@ -26,6 +26,17 @@ pub struct Opts {
     /// doesn't previously have a name.
     #[clap(long)]
     name_unnamed: bool,
+
+    /// Print instructions in the folded format.
+    #[clap(short, long)]
+    fold_instructions: bool,
+
+    /// The string to use when indenting.
+    #[clap(long)]
+    indent_text: Option<String>,
+    /// Number of spaces used for indentation, has lower priority than `--indent-text`
+    #[clap(long)]
+    indent: Option<usize>,
 }
 
 impl Opts {
@@ -40,6 +51,17 @@ impl Opts {
         config.print_offsets(self.print_offsets);
         config.print_skeleton(self.skeleton);
         config.name_unnamed(self.name_unnamed);
+        config.fold_instructions(self.fold_instructions);
+        match self.indent_text.as_ref() {
+            Some(s) => {
+                config.indent_text(s);
+            }
+            None => {
+                if let Some(s) = self.indent {
+                    config.indent_text(&" ".repeat(s));
+                }
+            }
+        }
         self.io.output(wasm_tools::Output::Wat {
             wasm: &wasm,
             config,

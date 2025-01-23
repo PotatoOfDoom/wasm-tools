@@ -21,9 +21,9 @@ log = { workspace = true }
 rand = { workspace = true }
 clap = { workspace = true, optional = true }
 wasm-mutate = { workspace = true }
-wasmparser = { workspace = true, features = ['validate', 'features'] }
+wasmparser = { workspace = true, features = ['std', 'validate', 'features'] }
 
 [dev-dependencies]
 env_logger = { workspace = true }
-wasmprinter = { path = "../wasmprinter" }
-wat = { path = "../wat" }
+wasmprinter = { workspace = true }
+wat = { workspace = true }
