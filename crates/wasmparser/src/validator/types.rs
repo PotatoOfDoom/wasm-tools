@@ -12,9 +12,9 @@ use crate::{
     Result, SubType, TableType, TypeRef, UnpackedIndex, ValType, WithRecGroup,
 };
 use crate::{FuncType, HeapType, ValidatorId};
-#[cfg(not(feature = "portable-atomics"))]
+#[cfg(not(feature = "portable-atomic"))]
 use alloc::sync::Arc;
-#[cfg(feature = "portable-atomics")]
+#[cfg(feature = "portable-atomic")]
 use portable_atomic_util::Arc;
 use core::ops::{Deref, DerefMut, Index, Range};
 use core::{hash::Hash, mem};

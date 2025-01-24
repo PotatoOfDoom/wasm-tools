@@ -185,7 +185,7 @@ where
     }
 }
 
-#[cfg(not(feature = "portable-atomics"))]
+#[cfg(not(feature = "portable-atomic"))]
 use alloc::sync::Arc;
 #[cfg(feature = "portable-atomics")]
 use portable_atomic_util::Arc;

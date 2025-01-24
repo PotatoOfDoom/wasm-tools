@@ -21,13 +21,13 @@ use crate::{
 use ::core::mem;
 use ::core::ops::Range;
 use ::core::sync::atomic::Ordering;
-#[cfg(not(feature = "portable-atomics"))]
+#[cfg(not(feature = "portable-atomic"))]
 use alloc::sync::Arc;
-#[cfg(not(feature = "portable-atomics"))]
+#[cfg(not(feature = "portable-atomic"))]
 use ::core::sync::atomic::AtomicUsize;
-#[cfg(feature = "portable-atomics")]
+#[cfg(feature = "portable-atomic")]
 use portable_atomic::AtomicUsize;
-#[cfg(feature = "portable-atomics")]
+#[cfg(feature = "portable-atomic")]
 use portable_atomic_util::Arc;
 
 /// Test whether the given buffer contains a valid WebAssembly module or component,
