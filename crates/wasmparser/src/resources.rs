@@ -187,7 +187,7 @@ where
 
 #[cfg(not(feature = "portable-atomic"))]
 use alloc::sync::Arc;
-#[cfg(feature = "portable-atomics")]
+#[cfg(feature = "portable-atomic")]
 use portable_atomic_util::Arc;
 impl<T> WasmModuleResources for Arc<T>
 where
