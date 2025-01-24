@@ -72,7 +72,7 @@ validate = []
 # `wasmparser::collections`
 serde = ['dep:serde', 'indexmap?/serde', 'hashbrown?/serde']
 
-portable-atomics = ["portable-atomic-util", "portable-atomic"]
+portable-atomic = ["portable-atomic-util", "portable-atomic"]
 # A feature that enables the guts of the `WasmFeatures` type in this crate.
 #
 # This feature is enabled by default. When disabled this crate does not support
